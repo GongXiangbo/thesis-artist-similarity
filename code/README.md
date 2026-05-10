@@ -23,6 +23,7 @@ This version keeps your original research direction and model definitions, but r
      - `filter_triplets`
      - `create_triplets`
      - `create_dataloaders`
+   - Enforced artist-disjoint train/validation splitting by default to prevent leakage through anchor, positive, or negative artists.
 
 4. **Improved engineering quality**
    - Added deterministic seed utility in `utils.py`.
@@ -32,6 +33,20 @@ This version keeps your original research direction and model definitions, but r
 5. **Added unified experiment script**
    - `experiment.py` can train any of the five models from one command.
    - This is cleaner than maintaining five nearly identical notebooks.
+
+## Leakage-safe split protocol
+
+Final experiments should use the strict artist-disjoint protocol now implemented in `dataset.py` and `cv_training.py`. In each fold or hold-out split, an artist is allowed to appear on only one side of the split, regardless of whether it appears as an anchor, positive, or negative artist. Triplets that cross the artist partition are dropped.
+
+The expected split stats should report:
+
+```text
+artist_overlap: False
+anchor_overlap: False
+strategy: artist_disjoint or artist_disjoint_kfold
+```
+
+The previous anchor-only protocol is not recommended for final reporting because positive/negative artists can leak into validation.
 
 ---
 

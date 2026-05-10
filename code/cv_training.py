@@ -42,67 +42,164 @@ class FoldTrainingConfig:
     grad_clip: float | None = 1.0
 
 
+def _normalise_triplet_df(df: pd.DataFrame) -> pd.DataFrame:
+    missing = set(TRIPLET_COLUMNS) - set(df.columns)
+    if missing:
+        raise ValueError(f"Missing required triplet column(s): {sorted(missing)}")
+    out = df.loc[:, list(TRIPLET_COLUMNS)].copy()
+    for col in TRIPLET_COLUMNS:
+        out[col] = out[col].astype(str)
+    return out.drop_duplicates().reset_index(drop=True)
+
+
+def _all_triplet_artists(df: pd.DataFrame) -> set[str]:
+    if df.empty:
+        return set()
+    return set(df[list(TRIPLET_COLUMNS)].to_numpy().reshape(-1))
+
+
+def _rows_fully_inside_artists(df: pd.DataFrame, artists: set[str]) -> pd.Series:
+    """Return rows where anchor, positive and negative are all inside artists."""
+    return df[list(TRIPLET_COLUMNS)].isin(artists).all(axis=1)
+
+
+def _build_artist_disjoint_fold_stats(
+    *,
+    fold_id: int,
+    strategy: str,
+    original_rows: int,
+    train_df: pd.DataFrame,
+    val_df: pd.DataFrame,
+    train_artists_partition: set[str],
+    val_artists_partition: set[str],
+) -> dict[str, Any]:
+    train_artist_set = _all_triplet_artists(train_df)
+    val_artist_set = _all_triplet_artists(val_df)
+    used_rows = len(train_df) + len(val_df)
+    return {
+        "fold": fold_id,
+        "strategy": strategy,
+        "train_rows": len(train_df),
+        "val_rows": len(val_df),
+        "dropped_cross_partition_rows": original_rows - used_rows,
+        "kept_row_ratio": used_rows / original_rows if original_rows else 0.0,
+        "train_artists": len(train_artist_set),
+        "val_artists": len(val_artist_set),
+        "train_artist_partition_size": len(train_artists_partition),
+        "val_artist_partition_size": len(val_artists_partition),
+        "anchor_overlap": bool(set(train_df["anchor"]) & set(val_df["anchor"])),
+        "artist_overlap": bool(train_artist_set & val_artist_set),
+    }
+
+
+def make_artist_disjoint_kfold_splits(
+    df: pd.DataFrame,
+    n_splits: int = 5,
+    seed: int = 3407,
+    *,
+    shuffle_trials: int = 25,
+) -> list[tuple[int, pd.DataFrame, pd.DataFrame, dict[str, Any]]]:
+    """Create K-fold CV splits with zero artist leakage.
+
+    A row is assigned to a fold only when all three artists in that triplet
+    (anchor, positive and negative) belong to the same side of the split. Rows
+    crossing the train/validation artist boundary are dropped for that fold.
+
+    This is stricter than anchor-group CV: no artist can appear anywhere in both
+    train and validation, regardless of whether it appears as anchor, positive,
+    or negative. If a fold cannot produce both train and validation triplets, the
+    function raises an error instead of silently falling back to a leaky split.
+    """
+    if n_splits < 2:
+        raise ValueError("n_splits must be at least 2")
+    if shuffle_trials < 1:
+        raise ValueError("shuffle_trials must be at least 1")
+
+    df = _normalise_triplet_df(df)
+    if len(df) < n_splits:
+        raise ValueError(f"Need at least {n_splits} triplets, found {len(df)}")
+
+    artists = np.array(sorted(_all_triplet_artists(df)), dtype=object)
+    if len(artists) < n_splits:
+        raise ValueError(
+            f"Need at least {n_splits} unique artists for artist-disjoint {n_splits}-fold CV, "
+            f"but only found {len(artists)}."
+        )
+
+    rng = np.random.default_rng(seed)
+    best_folds: list[tuple[int, pd.DataFrame, pd.DataFrame, dict[str, Any]]] | None = None
+    best_score: tuple[int, int, float] | None = None
+
+    for _ in range(shuffle_trials):
+        shuffled_artists = artists.copy()
+        rng.shuffle(shuffled_artists)
+        artist_folds = [set(map(str, fold.tolist())) for fold in np.array_split(shuffled_artists, n_splits)]
+
+        candidate_folds = []
+        min_val_rows = 10**18
+        total_used_rows = 0
+        total_val_rows = 0
+        valid = True
+
+        for fold_id, val_artist_partition in enumerate(artist_folds, start=1):
+            train_artist_partition = set(map(str, shuffled_artists.tolist())) - val_artist_partition
+            train_mask = _rows_fully_inside_artists(df, train_artist_partition)
+            val_mask = _rows_fully_inside_artists(df, val_artist_partition)
+            train_df = df.loc[train_mask].reset_index(drop=True)
+            val_df = df.loc[val_mask].reset_index(drop=True)
+
+            if train_df.empty or val_df.empty:
+                valid = False
+                break
+
+            stats = _build_artist_disjoint_fold_stats(
+                fold_id=fold_id,
+                strategy="artist_disjoint_kfold",
+                original_rows=len(df),
+                train_df=train_df,
+                val_df=val_df,
+                train_artists_partition=train_artist_partition,
+                val_artists_partition=val_artist_partition,
+            )
+            if stats["artist_overlap"]:
+                raise RuntimeError(f"Internal error: fold {fold_id} is not artist-disjoint")
+
+            candidate_folds.append((fold_id, train_df, val_df, stats))
+            min_val_rows = min(min_val_rows, len(val_df))
+            total_val_rows += len(val_df)
+            total_used_rows += len(train_df) + len(val_df)
+
+        if not valid:
+            continue
+
+        # Prioritize a usable validation set in every fold, then total retained
+        # triplets, then average validation size.
+        score = (min_val_rows, total_used_rows, total_val_rows / n_splits)
+        if best_score is None or score > best_score:
+            best_score = score
+            best_folds = candidate_folds
+
+    if best_folds is None:
+        raise ValueError(
+            "Could not create non-empty artist-disjoint folds. The triplet graph is too sparse for this n_splits. "
+            "Try reducing n_splits, increasing the dataset size, or using a hold-out artist-disjoint split."
+        )
+
+    return best_folds
+
+
 def make_anchor_group_kfold_splits(
     df: pd.DataFrame,
     n_splits: int = 5,
     seed: int = 3407,
 ) -> list[tuple[int, pd.DataFrame, pd.DataFrame, dict[str, Any]]]:
-    """Create 5-fold CV splits grouped by anchor artist.
+    """Deprecated compatibility wrapper.
 
-    Validation folds contain anchors that never appear as anchors in the matching
-    training fold. Positive/negative artists may still overlap, which keeps the
-    sparse triplet graph usable while preserving the previous notebook protocol.
+    Older notebooks imported this name. It now returns artist-disjoint folds to
+    prevent leakage through positive/negative artists. Use
+    ``make_artist_disjoint_kfold_splits`` in new code for clarity.
     """
-    if n_splits < 2:
-        raise ValueError("n_splits must be at least 2")
-
-    df = df.copy().reset_index(drop=True)
-    for col in TRIPLET_COLUMNS:
-        if col not in df.columns:
-            raise ValueError(f"Missing required triplet column: {col}")
-        df[col] = df[col].astype(str)
-
-    anchors = np.array(sorted(df["anchor"].unique()), dtype=object)
-    if len(anchors) < n_splits:
-        raise ValueError(
-            f"Need at least {n_splits} unique anchors for {n_splits}-fold CV, "
-            f"but only found {len(anchors)}."
-        )
-
-    rng = np.random.default_rng(seed)
-    rng.shuffle(anchors)
-    anchor_folds = np.array_split(anchors, n_splits)
-
-    folds = []
-    for fold_id, val_anchor_array in enumerate(anchor_folds, start=1):
-        val_anchors = set(map(str, val_anchor_array.tolist()))
-        val_mask = df["anchor"].isin(val_anchors)
-
-        train_df = df.loc[~val_mask].reset_index(drop=True)
-        val_df = df.loc[val_mask].reset_index(drop=True)
-        if train_df.empty or val_df.empty:
-            raise ValueError(f"Fold {fold_id} produced an empty train or validation split")
-
-        train_anchor_set = set(train_df["anchor"])
-        val_anchor_set = set(val_df["anchor"])
-        train_artist_set = set(train_df[list(TRIPLET_COLUMNS)].to_numpy().reshape(-1))
-        val_artist_set = set(val_df[list(TRIPLET_COLUMNS)].to_numpy().reshape(-1))
-
-        stats = {
-            "fold": fold_id,
-            "strategy": "anchor_group_kfold",
-            "train_rows": len(train_df),
-            "val_rows": len(val_df),
-            "train_anchors": len(train_anchor_set),
-            "val_anchors": len(val_anchor_set),
-            "anchor_overlap": bool(train_anchor_set & val_anchor_set),
-            "train_artists": len(train_artist_set),
-            "val_artists": len(val_artist_set),
-            "artist_overlap": bool(train_artist_set & val_artist_set),
-        }
-        folds.append((fold_id, train_df, val_df, stats))
-
-    return folds
+    return make_artist_disjoint_kfold_splits(df, n_splits=n_splits, seed=seed)
 
 
 def make_cosine_triplet_criterion(margin: float):

@@ -333,46 +333,106 @@ def filter_triplets(df: pd.DataFrame, artist_averages: dict[str, Tensor]) -> pd.
     return out.loc[mask].drop_duplicates().reset_index(drop=True)
 
 
+def _all_triplet_artists(df: pd.DataFrame) -> set[str]:
+    if df.empty:
+        return set()
+    return set(df[list(TRIPLET_COLUMNS)].to_numpy().reshape(-1))
+
+
+def _rows_fully_inside_artists(df: pd.DataFrame, artists: set[str]) -> pd.Series:
+    return df[list(TRIPLET_COLUMNS)].isin(artists).all(axis=1)
+
+
 def split_triplet_dataframe_by_artist(
     df: pd.DataFrame,
     train_ratio: float = 0.8,
     seed: int = 3407,
     strict_artist_disjoint: bool = True,
-) -> tuple[pd.DataFrame, pd.DataFrame, dict[str, int | bool | str]]:
-    """
-    Split a triplet dataframe into train/validation sets.
+    *,
+    allow_leaky_fallback: bool = False,
+    shuffle_trials: int = 100,
+) -> tuple[pd.DataFrame, pd.DataFrame, dict[str, int | float | bool | str]]:
+    """Split a triplet dataframe into train/validation sets.
 
-    It first tries artist-disjoint splitting, then anchor-disjoint splitting, and
-    finally deterministic row-level splitting. The fallback behaviour avoids hard
-    failure on sparse triplet graphs while still reporting the actual strategy.
+    By default this function enforces **artist-disjoint** splitting: no artist may
+    appear in both train and validation in any triplet role (anchor, positive or
+    negative). Rows whose three artists cross the train/validation artist
+    boundary are dropped instead of being assigned to either split.
+
+    Set ``allow_leaky_fallback=True`` only for quick debugging. Final thesis
+    experiments should keep the default, otherwise reported validation scores can
+    be inflated by artist leakage.
     """
     if not 0 < train_ratio < 1:
         raise ValueError("train_ratio must be between 0 and 1")
+    if shuffle_trials < 1:
+        raise ValueError("shuffle_trials must be at least 1")
+
     df = _normalise_triplet_df(df).drop_duplicates().reset_index(drop=True)
     if len(df) < 2:
         raise ValueError("Need at least two triplets to create train/validation splits")
 
     rng = np.random.default_rng(seed)
-    artists = sorted(set(df[list(TRIPLET_COLUMNS)].to_numpy().reshape(-1)))
-    rng.shuffle(artists)
-    train_artist_count = max(1, min(len(artists) - 1, int(round(train_ratio * len(artists)))))
-    train_artists = set(artists[:train_artist_count])
-    val_artists = set(artists[train_artist_count:])
+    artists = np.array(sorted(_all_triplet_artists(df)), dtype=object)
+    if len(artists) < 2:
+        raise ValueError("Need at least two unique artists to create artist-disjoint splits")
 
-    if strict_artist_disjoint and train_artists and val_artists:
-        train_mask = df[list(TRIPLET_COLUMNS)].isin(train_artists).all(axis=1)
-        val_mask = df[list(TRIPLET_COLUMNS)].isin(val_artists).all(axis=1)
-        train_df = df.loc[train_mask].reset_index(drop=True)
-        val_df = df.loc[val_mask].reset_index(drop=True)
-        if not train_df.empty and not val_df.empty:
-            return train_df, val_df, {
+    best_candidate: tuple[pd.DataFrame, pd.DataFrame, dict[str, int | float | bool | str]] | None = None
+    best_score: tuple[int, int, float] | None = None
+
+    if strict_artist_disjoint:
+        for _ in range(shuffle_trials):
+            shuffled_artists = artists.copy()
+            rng.shuffle(shuffled_artists)
+            train_artist_count = max(1, min(len(shuffled_artists) - 1, int(round(train_ratio * len(shuffled_artists)))))
+            train_artist_partition = set(map(str, shuffled_artists[:train_artist_count].tolist()))
+            val_artist_partition = set(map(str, shuffled_artists[train_artist_count:].tolist()))
+
+            train_mask = _rows_fully_inside_artists(df, train_artist_partition)
+            val_mask = _rows_fully_inside_artists(df, val_artist_partition)
+            train_df = df.loc[train_mask].reset_index(drop=True)
+            val_df = df.loc[val_mask].reset_index(drop=True)
+            if train_df.empty or val_df.empty:
+                continue
+
+            train_all_artists = _all_triplet_artists(train_df)
+            val_all_artists = _all_triplet_artists(val_df)
+            if train_all_artists & val_all_artists:
+                raise RuntimeError("Internal error: artist-disjoint split produced overlapping artists")
+
+            used_rows = len(train_df) + len(val_df)
+            stats = {
                 "strategy": "artist_disjoint",
                 "train_rows": len(train_df),
                 "val_rows": len(val_df),
-                "train_artists": len(train_artists),
-                "val_artists": len(val_artists),
+                "dropped_cross_partition_rows": len(df) - used_rows,
+                "kept_row_ratio": used_rows / len(df),
+                "train_artists": len(train_all_artists),
+                "val_artists": len(val_all_artists),
+                "train_artist_partition_size": len(train_artist_partition),
+                "val_artist_partition_size": len(val_artist_partition),
                 "artist_overlap": False,
+                "anchor_overlap": bool(set(train_df["anchor"]) & set(val_df["anchor"])),
             }
+
+            # Prefer a larger validation set, then more retained rows, then a
+            # split closer to the requested ratio.
+            realised_train_ratio = len(train_df) / used_rows
+            score = (len(val_df), used_rows, -abs(realised_train_ratio - train_ratio))
+            if best_score is None or score > best_score:
+                best_score = score
+                best_candidate = (train_df, val_df, stats)
+
+        if best_candidate is not None:
+            return best_candidate
+
+        if not allow_leaky_fallback:
+            raise ValueError(
+                "Could not create a non-empty artist-disjoint train/validation split. "
+                "The triplet graph is too sparse for the requested train_ratio. "
+                "Try a different seed/train_ratio, collect more triplets, or explicitly set "
+                "allow_leaky_fallback=True only for debugging."
+            )
 
     anchors = sorted(df["anchor"].unique())
     rng.shuffle(anchors)
@@ -382,30 +442,32 @@ def split_triplet_dataframe_by_artist(
         train_df = df.loc[df["anchor"].isin(train_anchors)].reset_index(drop=True)
         val_df = df.loc[~df["anchor"].isin(train_anchors)].reset_index(drop=True)
         if not train_df.empty and not val_df.empty:
-            train_all_artists = set(train_df[list(TRIPLET_COLUMNS)].to_numpy().reshape(-1))
-            val_all_artists = set(val_df[list(TRIPLET_COLUMNS)].to_numpy().reshape(-1))
+            train_all_artists = _all_triplet_artists(train_df)
+            val_all_artists = _all_triplet_artists(val_df)
             return train_df, val_df, {
-                "strategy": "anchor_disjoint",
+                "strategy": "anchor_disjoint_leaky_fallback",
                 "train_rows": len(train_df),
                 "val_rows": len(val_df),
                 "train_artists": len(train_all_artists),
                 "val_artists": len(val_all_artists),
                 "artist_overlap": bool(train_all_artists & val_all_artists),
+                "anchor_overlap": bool(set(train_df["anchor"]) & set(val_df["anchor"])),
             }
 
     shuffled = df.sample(frac=1, random_state=seed).reset_index(drop=True)
     cut = max(1, min(len(shuffled) - 1, int(round(train_ratio * len(shuffled)))))
     train_df = shuffled.iloc[:cut].reset_index(drop=True)
     val_df = shuffled.iloc[cut:].reset_index(drop=True)
-    train_all_artists = set(train_df[list(TRIPLET_COLUMNS)].to_numpy().reshape(-1))
-    val_all_artists = set(val_df[list(TRIPLET_COLUMNS)].to_numpy().reshape(-1))
+    train_all_artists = _all_triplet_artists(train_df)
+    val_all_artists = _all_triplet_artists(val_df)
     return train_df, val_df, {
-        "strategy": "row_shuffle_fallback",
+        "strategy": "row_shuffle_leaky_fallback",
         "train_rows": len(train_df),
         "val_rows": len(val_df),
         "train_artists": len(train_all_artists),
         "val_artists": len(val_all_artists),
         "artist_overlap": bool(train_all_artists & val_all_artists),
+        "anchor_overlap": bool(set(train_df["anchor"]) & set(val_df["anchor"])),
     }
 
 
