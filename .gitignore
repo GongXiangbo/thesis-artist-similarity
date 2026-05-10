@@ -6,3 +6,6 @@ results/
 
 # 忽略 data 下的 video_embeddings 文件夹
 data/video_embeddings/
+
+# 忽略 code 下的 checkpoints 文件夹
+code/checkpoints/
