@@ -10,7 +10,8 @@ import torch
 from torch import nn, optim
 
 from dataset import (
-    build_positive_map,
+    build_negative_exclusion_map,
+    create_artist_memory_bank,
     create_dataloaders_from_triplet_lists,
     create_triplets,
     create_triplets_with_ids,
@@ -37,7 +38,7 @@ class FoldTrainingConfig:
     weight_decay: float = 1e-6
     early_stopping_patience: int | None = 8
     distance_fn: DistanceName = "cosine"
-    negative_mining: NegativeMiningMode = "batch_semihard"
+    negative_mining: NegativeMiningMode = "memory_bank_semihard"
     mining_fallback: str = "closest_valid"
     grad_clip: float | None = 1.0
 
@@ -229,14 +230,25 @@ def run_one_fold_margin(
     margin: float,
     artist_averages: dict[str, torch.Tensor],
     config: FoldTrainingConfig,
+    *,
+    negative_source_df: pd.DataFrame | None = None,
 ) -> dict[str, Any]:
-    if config.negative_mining == "batch_semihard":
+    uses_dynamic_mining = config.negative_mining in {"batch_semihard", "memory_bank_semihard"}
+    if uses_dynamic_mining:
         train_triplets = create_triplets_with_ids(train_df, artist_averages)
-        positive_map = build_positive_map(train_df, symmetric=True)
+        # Priority 6: exclude direct known positives and two-hop neighbours from
+        # the negative candidate pool. Passing the full filtered triplet graph as
+        # negative_source_df also protects direct positives that were dropped by
+        # artist-disjoint fold partitioning.
+        positive_map = build_negative_exclusion_map(negative_source_df if negative_source_df is not None else train_df, symmetric=True, include_two_hop=True)
     else:
         train_triplets = create_triplets(train_df, artist_averages)
         positive_map = None
     val_triplets = create_triplets(val_df, artist_averages)
+    if config.negative_mining == "memory_bank_semihard":
+        memory_bank_ids, memory_bank_tensors = create_artist_memory_bank(train_df, artist_averages)
+    else:
+        memory_bank_ids, memory_bank_tensors = None, None
 
     if not train_triplets or not val_triplets:
         raise RuntimeError(f"Fold {fold_id}, margin={margin}: empty train/validation triplets after tensor creation.")
@@ -279,6 +291,9 @@ def run_one_fold_margin(
             negative_mining=config.negative_mining,
             positive_map=positive_map,
             mining_fallback=config.mining_fallback,
+            memory_bank_ids=memory_bank_ids,
+            memory_bank_tensors=memory_bank_tensors,
+            memory_bank_batch_size=config.batch_size,
         )
         val_metrics = evaluate(
             model,
@@ -309,6 +324,7 @@ def run_one_fold_margin(
             "skipped_ratio": train_metrics.get("skipped_ratio", 0.0),
             "mean_pos_dist": train_metrics.get("mean_pos_dist", 0.0),
             "mean_neg_dist": train_metrics.get("mean_neg_dist", 0.0),
+            "memory_bank_size": train_metrics.get("memory_bank_size", 0),
             "lr": lr,
         }
         history.append(row)
@@ -331,11 +347,13 @@ def run_one_fold_margin(
             epochs_without_improvement += 1
 
         mining_bits = ""
-        if config.negative_mining == "batch_semihard":
+        if config.negative_mining in {"batch_semihard", "memory_bank_semihard"}:
+            bank_bits = f" | bank={train_metrics.get('memory_bank_size', 0)}" if config.negative_mining == "memory_bank_semihard" else ""
             mining_bits = (
                 f" | semi={train_metrics['semi_hard_ratio']:.1%}"
                 f" | fallback={train_metrics['fallback_ratio']:.1%}"
                 f" | skipped={train_metrics['skipped_ratio']:.1%}"
+                f"{bank_bits}"
             )
         print(
             f"fold={fold_id} | mining={config.negative_mining} | margin={margin:.2f} | "
@@ -410,6 +428,7 @@ def summarize_cv_results(
                 "mean_semi_hard_ratio": _history_mean(item, "semi_hard_ratio"),
                 "mean_fallback_ratio": _history_mean(item, "fallback_ratio"),
                 "mean_skipped_ratio": _history_mean(item, "skipped_ratio"),
+                "mean_memory_bank_size": _history_mean(item, "memory_bank_size"),
                 "checkpoint_path": item["checkpoint_path"],
                 "history_path": item["history_path"],
             }
@@ -432,6 +451,7 @@ def summarize_cv_results(
             mean_semi_hard_ratio=("mean_semi_hard_ratio", "mean"),
             mean_fallback_ratio=("mean_fallback_ratio", "mean"),
             mean_skipped_ratio=("mean_skipped_ratio", "mean"),
+            mean_memory_bank_size=("mean_memory_bank_size", "mean"),
         )
         .sort_values(
             ["mean_best_val_acc", "mean_best_val_loss"],

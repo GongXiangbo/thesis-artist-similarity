@@ -1,7 +1,7 @@
 """Unified training entrypoint for comparing TripletNet1~5.
 
 Example:
-    python code/experiment.py --model TripletNet1 --margin 0.5 --negative-mining batch_semihard
+    python code/experiment.py --model TripletNet1 --margin 0.5 --negative-mining memory_bank_semihard
 """
 
 from __future__ import annotations
@@ -14,7 +14,8 @@ import torch
 from torch import nn, optim
 
 from dataset import (
-    build_positive_map,
+    build_negative_exclusion_map,
+    create_artist_memory_bank,
     create_dataloaders_from_triplet_lists,
     create_triplets,
     create_triplets_with_ids,
@@ -53,9 +54,9 @@ def parse_args():
     parser.add_argument(
         "--negative-mining",
         type=str,
-        default="batch_semihard",
-        choices=["fixed", "random", "batch_semihard"],
-        help="'batch_semihard' mines negatives from unique artists in each training batch; validation stays fixed.",
+        default="memory_bank_semihard",
+        choices=["fixed", "random", "batch_semihard", "memory_bank_semihard"],
+        help="'memory_bank_semihard' mines hard negatives from all training artists each epoch; validation stays fixed.",
     )
     parser.add_argument("--mining-fallback", type=str, default="closest_valid")
     parser.add_argument("--train-ratio", type=float, default=0.8)
@@ -91,12 +92,19 @@ def main():
     print(f"Split stats: {split_stats}")
     print(f"Inferred embedding shape: seq_len={seq_len}, d_model={d_model}")
 
-    if args.negative_mining == "batch_semihard":
+    uses_dynamic_mining = args.negative_mining in {"batch_semihard", "memory_bank_semihard"}
+    if uses_dynamic_mining:
         train_triplets = create_triplets_with_ids(train_df, artist_averages)
-        positive_map = build_positive_map(train_df, symmetric=True)
+        # Priority 6: exclude known positives and two-hop neighbours so that
+        # hard negatives are less likely to be unlabelled true positives.
+        positive_map = build_negative_exclusion_map(filtered_df, symmetric=True, include_two_hop=True)
     else:
         train_triplets = create_triplets(train_df, artist_averages)
         positive_map = None
+    if args.negative_mining == "memory_bank_semihard":
+        memory_bank_ids, memory_bank_tensors = create_artist_memory_bank(train_df, artist_averages)
+    else:
+        memory_bank_ids, memory_bank_tensors = None, None
     val_triplets = create_triplets(val_df, artist_averages)
     train_loader, val_loader = create_dataloaders_from_triplet_lists(
         train_triplets,
@@ -130,6 +138,9 @@ def main():
             negative_mining=args.negative_mining,
             positive_map=positive_map,
             mining_fallback=args.mining_fallback,
+            memory_bank_ids=memory_bank_ids,
+            memory_bank_tensors=memory_bank_tensors,
+            memory_bank_batch_size=args.batch_size,
         )
         val_metrics = evaluate(model, val_loader, criterion, device, args.distance_fn, return_details=True)
         scheduler.step(val_metrics["loss"])
@@ -158,11 +169,13 @@ def main():
             best_val_loss = val_metrics["loss"]
             best_state = {key: value.detach().cpu().clone() for key, value in model.state_dict().items()}
         mining_bits = ""
-        if args.negative_mining == "batch_semihard":
+        if args.negative_mining in {"batch_semihard", "memory_bank_semihard"}:
+            bank_bits = f" | bank={train_metrics.get('memory_bank_size', 0)}" if args.negative_mining == "memory_bank_semihard" else ""
             mining_bits = (
                 f" | semi={train_metrics['semi_hard_ratio']:.1%}"
                 f" | fallback={train_metrics['fallback_ratio']:.1%}"
                 f" | skipped={train_metrics['skipped_ratio']:.1%}"
+                f"{bank_bits}"
             )
         print(
             f"Epoch {epoch:03d}/{args.epochs} | "

@@ -34,6 +34,10 @@ This version keeps your original research direction and model definitions, but r
    - `experiment.py` can train any of the five models from one command.
    - This is cleaner than maintaining five nearly identical notebooks.
 
+## Recommended negative mining
+
+Use `--negative-mining memory_bank_semihard` for final TripletNet1 experiments. This implements global memory-bank hard-negative mining and avoids likely false negatives by masking known positives plus two-hop neighbours in the similarity graph. `batch_semihard` is still available for faster debugging, but it only mines within the current mini-batch.
+
 ## Leakage-safe split protocol
 
 Final experiments should use the strict artist-disjoint protocol now implemented in `dataset.py` and `cv_training.py`. In each fold or hold-out split, an artist is allowed to appear on only one side of the split, regardless of whether it appears as an anchor, positive, or negative artist. Triplets that cross the artist partition are dropped.
@@ -90,7 +94,7 @@ python code/experiment.py \
   --triplets-csv data/triplets/triplets_ids_spot.csv \
   --model TripletNet1 \
   --margin 0.5 \
-  --negative-mining batch_semihard \
+  --negative-mining memory_bank_semihard \
   --epochs 30
 ```
 

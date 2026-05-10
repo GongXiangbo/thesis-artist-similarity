@@ -476,10 +476,10 @@ def build_positive_map(
     *,
     symmetric: bool = True,
 ) -> dict[str, set[str]]:
-    """Build an anchor -> known-positive artist map from triplet rows.
+    """Build an anchor -> direct known-positive artist map from triplet rows.
 
-    This is intentionally fold-local: callers should pass only the training
-    dataframe for the current fold when using it for negative mining.
+    Use this map to avoid choosing labelled similar artists as negatives. For
+    stricter negative sampling, prefer ``build_negative_exclusion_map(...)``.
     """
     df = _normalise_triplet_df(triplet_df)
     positive_map: dict[str, set[str]] = defaultdict(set)
@@ -492,6 +492,55 @@ def build_positive_map(
         if symmetric:
             positive_map[positive].add(anchor)
     return {artist_id: set(positives) for artist_id, positives in positive_map.items()}
+
+
+def build_negative_exclusion_map(
+    triplet_df: pd.DataFrame,
+    *,
+    symmetric: bool = True,
+    include_two_hop: bool = True,
+) -> dict[str, set[str]]:
+    """Build artist sets that should not be sampled as negatives.
+
+    Priority 6: reduce false negatives. Direct known positives are always
+    excluded. With ``include_two_hop=True`` we also exclude friends-of-friends in
+    the similarity graph, which avoids sampling artists from the same local
+    similarity cluster as hard negatives. This is intentionally conservative: if
+    the candidate pool becomes too small, the miner reports skipped anchors
+    rather than silently using likely false negatives.
+    """
+    direct_map = build_positive_map(triplet_df, symmetric=symmetric)
+    exclusion_map: dict[str, set[str]] = {artist_id: set(positives) for artist_id, positives in direct_map.items()}
+
+    if include_two_hop:
+        for artist_id, direct_positives in direct_map.items():
+            two_hop: set[str] = set()
+            for positive_id in direct_positives:
+                two_hop.update(direct_map.get(positive_id, set()))
+            two_hop.discard(artist_id)
+            exclusion_map.setdefault(artist_id, set()).update(two_hop)
+
+    return exclusion_map
+
+
+def create_artist_memory_bank(
+    triplet_df: pd.DataFrame,
+    artist_averages: dict[str, Tensor],
+) -> tuple[list[str], list[Tensor]]:
+    """Return all unique training artists and tensors for global negative mining."""
+    df = _normalise_triplet_df(triplet_df)
+    artists = {str(key): value for key, value in artist_averages.items()}
+    ids: list[str] = []
+    tensors: list[Tensor] = []
+    for artist_id in sorted(_all_triplet_artists(df)):
+        tensor = artists.get(str(artist_id))
+        if tensor is None:
+            continue
+        ids.append(str(artist_id))
+        tensors.append(tensor.float().cpu())
+    if not ids:
+        raise ValueError("Cannot build memory bank: no triplet artists have embeddings")
+    return ids, tensors
 
 
 def create_triplets(filtered_df: pd.DataFrame, artist_averages: dict[str, Tensor]) -> list[tuple[Tensor, Tensor, Tensor]]:
