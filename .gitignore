@@ -1,0 +1,8 @@
+# JetBrains IDE
+.idea/
+
+# 忽略整个 results 文件夹
+results/
+
+# 忽略 data 下的 video_embeddings 文件夹
+data/video_embeddings/
