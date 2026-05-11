@@ -223,6 +223,73 @@ def _state_dict_to_cpu(model: nn.Module) -> dict[str, torch.Tensor]:
     return {name: tensor.detach().cpu().clone() for name, tensor in model.state_dict().items()}
 
 
+@torch.inference_mode()
+def _compute_validation_retrieval_mrr(
+    model: nn.Module,
+    val_df: pd.DataFrame,
+    artist_averages: dict[str, torch.Tensor],
+    device: torch.device | str,
+) -> float:
+    """Compute retrieval-style MRR on the validation artist subgraph.
+
+    The checkpoint selection target should match the final retrieval analysis more
+    closely than triplet ranking accuracy. For every validation anchor, all
+    validation artists are ranked by cosine similarity in the learned latent space;
+    the score is the reciprocal rank of the first known validation positive.
+    """
+    clean = _normalise_triplet_df(val_df)
+    available_ids = sorted(
+        artist_id for artist_id in _all_triplet_artists(clean)
+        if artist_id in artist_averages
+    )
+    if len(available_ids) < 2:
+        return 0.0
+
+    positive_sets: dict[str, set[str]] = {artist_id: set() for artist_id in available_ids}
+    available_set = set(available_ids)
+    for row in clean.itertuples(index=False):
+        anchor = str(getattr(row, "anchor"))
+        positive = str(getattr(row, "positive"))
+        if anchor in available_set and positive in available_set and anchor != positive:
+            positive_sets.setdefault(anchor, set()).add(positive)
+            # Treat similarity as symmetric for retrieval evaluation, matching the
+            # downstream analysis convention used in the notebooks.
+            positive_sets.setdefault(positive, set()).add(anchor)
+
+    anchor_ids = [artist_id for artist_id, positives in positive_sets.items() if positives]
+    if not anchor_ids:
+        return 0.0
+
+    was_training = bool(model.training)
+    model.eval()
+    embeddings: list[torch.Tensor] = []
+    for artist_id in available_ids:
+        tensor = artist_averages[artist_id].unsqueeze(0).to(device).float()
+        emb = model.forward_once(tensor).detach().float()
+        emb = torch.nn.functional.normalize(emb, dim=1, eps=1e-8)
+        embeddings.append(emb.squeeze(0).cpu())
+    if was_training:
+        model.train()
+
+    matrix = torch.stack(embeddings, dim=0)
+    similarity = (matrix @ matrix.T).numpy()
+    np.fill_diagonal(similarity, -np.inf)
+    id_to_idx = {artist_id: idx for idx, artist_id in enumerate(available_ids)}
+
+    reciprocal_ranks: list[float] = []
+    for anchor_id in anchor_ids:
+        anchor_idx = id_to_idx[anchor_id]
+        positives = {p for p in positive_sets[anchor_id] if p in id_to_idx and p != anchor_id}
+        if not positives:
+            continue
+        order = np.argsort(-similarity[anchor_idx])
+        ranked_ids = [available_ids[i] for i in order]
+        first_rank = next((rank for rank, candidate in enumerate(ranked_ids, start=1) if candidate in positives), None)
+        reciprocal_ranks.append(0.0 if first_rank is None else 1.0 / float(first_rank))
+
+    return float(np.mean(reciprocal_ranks)) if reciprocal_ranks else 0.0
+
+
 def run_one_fold_margin(
     fold_id: int,
     train_df: pd.DataFrame,
@@ -270,6 +337,7 @@ def run_one_fold_margin(
         patience=3,
     )
 
+    best_val_mrr = -1.0
     best_val_acc = -1.0
     best_val_margin_acc = -1.0
     best_val_loss = float("inf")
@@ -303,6 +371,7 @@ def run_one_fold_margin(
             distance_fn=config.distance_fn,
             return_details=True,
         )
+        val_mrr = _compute_validation_retrieval_mrr(model, val_df, artist_averages, config.device)
         scheduler.step(val_metrics["loss"])
 
         lr = optimizer.param_groups[0]["lr"]
@@ -317,6 +386,7 @@ def run_one_fold_margin(
             "train_triplet_acc": train_metrics["ranking_acc"],
             "train_margin_acc": train_metrics["margin_acc"],
             "val_loss": val_metrics["loss"],
+            "val_mrr": val_mrr,
             "val_acc": val_metrics["ranking_acc"],
             "val_margin_acc": val_metrics["margin_acc"],
             "semi_hard_ratio": train_metrics.get("semi_hard_ratio", 0.0),
@@ -330,13 +400,19 @@ def run_one_fold_margin(
         history.append(row)
 
         improved = (
-            (val_metrics["ranking_acc"] > best_val_acc)
+            (val_mrr > best_val_mrr)
             or (
-                val_metrics["ranking_acc"] == best_val_acc
+                val_mrr == best_val_mrr
+                and val_metrics["ranking_acc"] > best_val_acc
+            )
+            or (
+                val_mrr == best_val_mrr
+                and val_metrics["ranking_acc"] == best_val_acc
                 and val_metrics["loss"] < best_val_loss
             )
         )
         if improved:
+            best_val_mrr = val_mrr
             best_val_acc = val_metrics["ranking_acc"]
             best_val_margin_acc = val_metrics["margin_acc"]
             best_val_loss = val_metrics["loss"]
@@ -359,8 +435,9 @@ def run_one_fold_margin(
             f"fold={fold_id} | mining={config.negative_mining} | margin={margin:.2f} | "
             f"epoch={epoch:03d}/{config.num_epochs} | "
             f"train_loss={train_metrics['loss']:.5f} | train_acc={train_metrics['ranking_acc']:.2%} | "
-            f"val_loss={val_metrics['loss']:.5f} | val_acc={val_metrics['ranking_acc']:.2%} | "
-            f"val_margin_acc={val_metrics['margin_acc']:.2%} | lr={lr:.2e}{mining_bits}"
+            f"val_loss={val_metrics['loss']:.5f} | val_mrr={val_mrr:.4f} | "
+            f"val_acc={val_metrics['ranking_acc']:.2%} | val_margin_acc={val_metrics['margin_acc']:.2%} | "
+            f"lr={lr:.2e}{mining_bits}"
         )
 
         if (
@@ -368,7 +445,7 @@ def run_one_fold_margin(
             and epochs_without_improvement >= config.early_stopping_patience
         ):
             print(
-                f"Early stopping at epoch {epoch}: no validation ranking-accuracy improvement "
+                f"Early stopping at epoch {epoch}: no validation MRR improvement "
                 f"for {config.early_stopping_patience} epochs."
             )
             break
@@ -391,6 +468,7 @@ def run_one_fold_margin(
         "negative_mining": config.negative_mining,
         "best_epoch": best_epoch,
         "epochs_ran": len(history_df),
+        "best_val_mrr": best_val_mrr,
         "best_val_acc": best_val_acc,
         "best_val_margin_acc": best_val_margin_acc,
         "best_val_loss": best_val_loss,
@@ -422,6 +500,7 @@ def summarize_cv_results(
                 "fold": item["fold"],
                 "best_epoch": item["best_epoch"],
                 "epochs_ran": item["epochs_ran"],
+                "best_val_mrr": item.get("best_val_mrr", float("nan")),
                 "best_val_acc": item["best_val_acc"],
                 "best_val_margin_acc": item["best_val_margin_acc"],
                 "best_val_loss": item["best_val_loss"],
@@ -440,6 +519,8 @@ def summarize_cv_results(
         fold_summary_df
         .groupby(["model", "negative_mining", "margin"], as_index=False)
         .agg(
+            mean_best_val_mrr=("best_val_mrr", "mean"),
+            std_best_val_mrr=("best_val_mrr", "std"),
             mean_best_val_acc=("best_val_acc", "mean"),
             std_best_val_acc=("best_val_acc", "std"),
             mean_best_val_margin_acc=("best_val_margin_acc", "mean"),
@@ -454,8 +535,8 @@ def summarize_cv_results(
             mean_memory_bank_size=("mean_memory_bank_size", "mean"),
         )
         .sort_values(
-            ["mean_best_val_acc", "mean_best_val_loss"],
-            ascending=[False, True],
+            ["mean_best_val_mrr", "mean_best_val_acc", "mean_best_val_loss"],
+            ascending=[False, False, True],
         )
         .reset_index(drop=True)
     )
