@@ -11,3 +11,5 @@ data/video_embeddings/
 code/checkpoints/
 
 **/.ipynb_checkpoints/
+
+__pycache__/
