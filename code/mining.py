@@ -107,6 +107,9 @@ class BatchSemiHardNegativeMiner:
         positive_ids: Tensor | Sequence[Any],
         candidate_ids: Tensor | Sequence[Any],
         positive_map: Mapping[Any, set[Any]] | None,
+        *,
+        candidate_valid_mask: Tensor | None = None,
+        return_selected_ids: bool = True,
     ) -> dict[str, Any]:
         if anchor_emb.ndim != 2 or positive_emb.ndim != 2 or candidate_emb.ndim != 2:
             raise ValueError("anchor_emb, positive_emb and candidate_emb must be 2D tensors")
@@ -127,24 +130,37 @@ class BatchSemiHardNegativeMiner:
 
         anchor_id_values = _ids_to_list(anchor_ids)
         positive_id_keys = _ids_to_keys(positive_ids)
-        candidate_id_keys = _ids_to_keys(candidate_ids)
+        candidate_id_count = int(candidate_ids.numel()) if isinstance(candidate_ids, torch.Tensor) else len(candidate_ids)
+        candidate_id_keys = (
+            _ids_to_keys(candidate_ids)
+            if candidate_valid_mask is None or return_selected_ids
+            else []
+        )
         if len(anchor_id_values) != batch_size or len(positive_id_keys) != batch_size:
             raise ValueError("anchor_ids and positive_ids must match the anchor batch size")
-        if len(candidate_id_keys) != candidate_count:
+        if candidate_id_count != candidate_count:
             raise ValueError("candidate_ids must match candidate_emb rows")
 
         pos_dist = self._pair_distance(anchor_emb, positive_emb)
         distance_matrix = self._distance_matrix(anchor_emb, candidate_emb)
 
-        valid_negative_mask = torch.ones((batch_size, candidate_count), dtype=torch.bool, device=device)
-        for row_idx, anchor_id in enumerate(anchor_id_values):
-            anchor_key = str(anchor_id)
-            known_positive_keys = _lookup_positive_set(positive_map, anchor_id, anchor_key)
-            # Always mask the paired positive, even if a sparse map missed it.
-            known_positive_keys.add(positive_id_keys[row_idx])
-            for col_idx, candidate_key in enumerate(candidate_id_keys):
-                if candidate_key == anchor_key or candidate_key in known_positive_keys:
-                    valid_negative_mask[row_idx, col_idx] = False
+        if candidate_valid_mask is not None:
+            if tuple(candidate_valid_mask.shape) != (batch_size, candidate_count):
+                raise ValueError(
+                    "candidate_valid_mask must have shape "
+                    f"({batch_size}, {candidate_count}), got {tuple(candidate_valid_mask.shape)}"
+                )
+            valid_negative_mask = candidate_valid_mask.to(device=device, dtype=torch.bool, non_blocking=True).clone()
+        else:
+            valid_negative_mask = torch.ones((batch_size, candidate_count), dtype=torch.bool, device=device)
+            for row_idx, anchor_id in enumerate(anchor_id_values):
+                anchor_key = str(anchor_id)
+                known_positive_keys = _lookup_positive_set(positive_map, anchor_id, anchor_key)
+                # Always mask the paired positive, even if a sparse map missed it.
+                known_positive_keys.add(positive_id_keys[row_idx])
+                for col_idx, candidate_key in enumerate(candidate_id_keys):
+                    if candidate_key == anchor_key or candidate_key in known_positive_keys:
+                        valid_negative_mask[row_idx, col_idx] = False
 
         inf = torch.tensor(float("inf"), device=device, dtype=distance_matrix.dtype)
         with torch.no_grad():
@@ -174,6 +190,13 @@ class BatchSemiHardNegativeMiner:
             valid_mask = has_valid
             fallback_mask = valid_mask & ~has_semi
             safe_idx = selected_idx.clamp_min(0)
+            selected_negative_indices = torch.full(
+                (batch_size,),
+                -1,
+                dtype=torch.long,
+                device=device,
+            )
+            selected_negative_indices[valid_mask] = safe_idx[valid_mask].long()
 
         neg_dist = torch.full_like(pos_dist, float("nan"))
         selected_negative_emb = candidate_emb[safe_idx] * valid_mask.to(candidate_emb.dtype).unsqueeze(1)
@@ -203,7 +226,8 @@ class BatchSemiHardNegativeMiner:
         return {
             "loss": loss,
             "selected_negative_emb": selected_negative_emb,
-            "selected_negative_ids": _selected_ids(candidate_ids, safe_idx, valid_mask),
+            "selected_negative_ids": _selected_ids(candidate_ids, safe_idx, valid_mask) if return_selected_ids else None,
+            "selected_negative_indices": selected_negative_indices,
             "valid_mask": valid_mask,
             "pos_dist": pos_dist,
             "neg_dist": neg_dist,

@@ -639,18 +639,29 @@ class TripletDataset(Dataset):
         return anchor.float(), positive.float(), negative.float()
 
 
+def _auto_num_workers() -> int:
+    if not torch.cuda.is_available():
+        return 0
+    cpu_count = os.cpu_count() or 1
+    return max(2, min(8, cpu_count // 2))
+
+
 def _make_loader(dataset: Dataset, batch_size: int, shuffle: bool, num_workers: int = 0) -> DataLoader:
     if batch_size <= 0:
         raise ValueError("batch_size must be positive")
+    if num_workers < 0:
+        num_workers = _auto_num_workers()
     pin_memory = torch.cuda.is_available()
-    return DataLoader(
-        dataset,
-        batch_size=batch_size,
-        shuffle=shuffle,
-        num_workers=num_workers,
-        pin_memory=pin_memory,
-        persistent_workers=num_workers > 0,
-    )
+    loader_kwargs = {
+        "batch_size": batch_size,
+        "shuffle": shuffle,
+        "num_workers": num_workers,
+        "pin_memory": pin_memory,
+        "persistent_workers": num_workers > 0,
+    }
+    if num_workers > 0:
+        loader_kwargs["prefetch_factor"] = 4
+    return DataLoader(dataset, **loader_kwargs)
 
 
 def create_dataloaders_from_triplet_lists(

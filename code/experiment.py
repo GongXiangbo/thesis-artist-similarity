@@ -28,7 +28,7 @@ from evaluate import evaluate
 from metrics import cosine_distance
 from model import build_model
 from train import train
-from utils import set_seed
+from utils import configure_torch_runtime, set_seed
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -45,8 +45,26 @@ def parse_args():
     parser.add_argument("--triplets-csv", type=str, default="data/triplets/triplets_ids_spot.csv")
     parser.add_argument("--model", type=str, default="TripletNet1")
     parser.add_argument("--epochs", type=int, default=30)
-    parser.add_argument("--batch-size", type=int, default=128)
-    parser.add_argument("--num-workers", type=int, default=0)
+    parser.add_argument("--batch-size", type=int, default=512)
+    parser.add_argument(
+        "--num-workers",
+        type=int,
+        default=-1,
+        help="DataLoader workers. Use -1 to auto-select a CUDA-friendly value.",
+    )
+    parser.add_argument("--memory-bank-batch-size", type=int, default=0)
+    parser.add_argument(
+        "--memory-bank-device-cache",
+        type=str,
+        default="auto",
+        choices=["auto", "on", "off"],
+        help="Cache memory-bank input tensors on the GPU when possible.",
+    )
+    parser.add_argument("--amp", type=str, default="auto", choices=["auto", "on", "off"])
+    parser.add_argument("--amp-dtype", type=str, default="float16", choices=["float16", "bfloat16"])
+    parser.add_argument("--matmul-precision", type=str, default="high", choices=["highest", "high", "medium"])
+    parser.add_argument("--deterministic", action="store_true")
+    parser.add_argument("--compile-model", action="store_true")
     parser.add_argument("--lr", type=float, default=2e-4)
     parser.add_argument("--weight-decay", type=float, default=1e-6)
     parser.add_argument("--margin", type=float, default=0.5)
@@ -65,10 +83,45 @@ def parse_args():
     return parser.parse_args()
 
 
+def _resolve_amp_enabled(value: str, device: torch.device | str) -> bool:
+    if value == "off":
+        return False
+    return torch.device(device).type == "cuda"
+
+
+def _resolve_memory_bank_device_cache(value: str) -> bool | None:
+    if value == "on":
+        return True
+    if value == "off":
+        return False
+    return None
+
+
+def _state_dict_to_cpu(model: nn.Module) -> dict[str, torch.Tensor]:
+    state_source = getattr(model, "_orig_mod", model)
+    return {key: value.detach().cpu().clone() for key, value in state_source.state_dict().items()}
+
+
+def _make_grad_scaler(enabled: bool):
+    if not enabled:
+        return None
+    try:
+        return torch.amp.GradScaler("cuda", enabled=True)
+    except (AttributeError, TypeError):
+        return torch.cuda.amp.GradScaler(enabled=True)
+
+
 def main():
     args = parse_args()
-    set_seed(args.seed)
+    set_seed(args.seed, deterministic=args.deterministic)
+    configure_torch_runtime(
+        deterministic=args.deterministic,
+        matmul_precision=args.matmul_precision,
+        allow_tf32=True,
+    )
     device = "cuda" if torch.cuda.is_available() else "cpu"
+    amp_enabled = _resolve_amp_enabled(args.amp, device)
+    memory_bank_device_cache = _resolve_memory_bank_device_cache(args.memory_bank_device_cache)
     base_dir = resolve_project_path(args.base_dir)
     triplets_csv = resolve_project_path(args.triplets_csv)
     output_dir = resolve_project_path(args.output_dir)
@@ -114,6 +167,11 @@ def main():
     )
 
     model = build_model(args.model, d_model=d_model, seq_len=seq_len).to(device)
+    if args.compile_model:
+        if hasattr(torch, "compile"):
+            model = torch.compile(model)
+        else:
+            print("torch.compile is not available in this PyTorch build; continuing without compilation.")
     if args.distance_fn == "cosine":
         criterion = nn.TripletMarginWithDistanceLoss(distance_function=cosine_distance, margin=args.margin, swap=True)
     else:
@@ -121,6 +179,15 @@ def main():
 
     optimizer = optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
     scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode="min", factor=0.7, patience=3)
+    scaler = _make_grad_scaler(amp_enabled)
+
+    print(
+        "Runtime: "
+        f"device={device} | amp={amp_enabled} ({args.amp_dtype}) | "
+        f"batch_size={args.batch_size} | num_workers={args.num_workers} | "
+        f"memory_bank_batch_size={args.memory_bank_batch_size or max(1024, args.batch_size * 4)} | "
+        f"memory_bank_device_cache={args.memory_bank_device_cache}"
+    )
 
     best_val_acc = -1.0
     best_val_loss = float("inf")
@@ -140,9 +207,22 @@ def main():
             mining_fallback=args.mining_fallback,
             memory_bank_ids=memory_bank_ids,
             memory_bank_tensors=memory_bank_tensors,
-            memory_bank_batch_size=args.batch_size,
+            memory_bank_batch_size=args.memory_bank_batch_size or None,
+            memory_bank_device_cache=memory_bank_device_cache,
+            amp_enabled=amp_enabled,
+            amp_dtype=args.amp_dtype,
+            scaler=scaler,
         )
-        val_metrics = evaluate(model, val_loader, criterion, device, args.distance_fn, return_details=True)
+        val_metrics = evaluate(
+            model,
+            val_loader,
+            criterion,
+            device,
+            args.distance_fn,
+            return_details=True,
+            amp_enabled=amp_enabled,
+            amp_dtype=args.amp_dtype,
+        )
         scheduler.step(val_metrics["loss"])
         row = {
             "epoch": epoch,
@@ -160,6 +240,8 @@ def main():
             "val_acc": val_metrics["ranking_acc"],
             "val_margin_acc": val_metrics["margin_acc"],
             "lr": optimizer.param_groups[0]["lr"],
+            "amp_enabled": train_metrics["amp_enabled"],
+            "memory_bank_cached_on_device": train_metrics["memory_bank_cached_on_device"],
         }
         history.append(row)
         if (val_metrics["ranking_acc"] > best_val_acc) or (
@@ -167,7 +249,7 @@ def main():
         ):
             best_val_acc = val_metrics["ranking_acc"]
             best_val_loss = val_metrics["loss"]
-            best_state = {key: value.detach().cpu().clone() for key, value in model.state_dict().items()}
+            best_state = _state_dict_to_cpu(model)
         mining_bits = ""
         if args.negative_mining in {"batch_semihard", "memory_bank_semihard"}:
             bank_bits = f" | bank={train_metrics.get('memory_bank_size', 0)}" if args.negative_mining == "memory_bank_semihard" else ""

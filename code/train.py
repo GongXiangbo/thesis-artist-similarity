@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
+from contextlib import nullcontext
 from typing import Any, Literal
 
 import torch
@@ -12,6 +13,47 @@ from mining import BatchSemiHardNegativeMiner
 
 
 NegativeMiningMode = Literal["fixed", "random", "batch_semihard", "memory_bank_semihard"]
+
+
+def _device_type(device: torch.device | str) -> str:
+    return torch.device(device).type
+
+
+def _amp_is_enabled(device: torch.device | str, enabled: bool | None) -> bool:
+    if enabled is None:
+        enabled = True
+    return bool(enabled) and _device_type(device) == "cuda"
+
+
+def _resolve_amp_dtype(dtype: torch.dtype | str) -> torch.dtype:
+    if isinstance(dtype, torch.dtype):
+        return dtype
+    normalised = str(dtype).lower().replace("torch.", "")
+    if normalised in {"float16", "fp16", "half"}:
+        return torch.float16
+    if normalised in {"bfloat16", "bf16"}:
+        return torch.bfloat16
+    raise ValueError("amp_dtype must be 'float16'/'fp16' or 'bfloat16'/'bf16'")
+
+
+def _autocast_context(device: torch.device | str, enabled: bool, dtype: torch.dtype):
+    if not enabled:
+        return nullcontext()
+    device_type = _device_type(device)
+    if hasattr(torch, "autocast"):
+        return torch.autocast(device_type=device_type, dtype=dtype, enabled=True)
+    if device_type == "cuda":
+        return torch.cuda.amp.autocast(dtype=dtype, enabled=True)
+    return nullcontext()
+
+
+def _make_grad_scaler(enabled: bool):
+    if not enabled:
+        return None
+    try:
+        return torch.amp.GradScaler("cuda", enabled=True)
+    except (AttributeError, TypeError):
+        return torch.cuda.amp.GradScaler(enabled=True)
 
 
 def _split_batch(batch) -> tuple[Tensor, Tensor, Tensor, Sequence[Any] | None, Sequence[Any] | None, Sequence[Any] | None]:
@@ -126,26 +168,109 @@ def _stack_memory_bank_tensors(memory_bank_tensors: Sequence[Tensor]) -> Tensor:
     return torch.stack([tensor.float().cpu() for tensor in memory_bank_tensors], dim=0)
 
 
+def _should_cache_memory_bank_on_device(
+    memory_inputs: Tensor,
+    device: torch.device | str,
+    requested: bool | None,
+) -> bool:
+    device_obj = torch.device(device)
+    if device_obj.type != "cuda":
+        return False
+    if requested is not None:
+        return bool(requested)
+    try:
+        with torch.cuda.device(device_obj):
+            free_bytes, _ = torch.cuda.mem_get_info()
+        required_bytes = memory_inputs.numel() * memory_inputs.element_size()
+        return required_bytes < int(free_bytes * 0.4)
+    except Exception:
+        return False
+
+
+def _build_memory_bank_valid_mask(
+    memory_ids: Sequence[Any],
+    positive_map: Mapping[Any, set[Any]] | None,
+    device: torch.device | str,
+) -> tuple[Tensor, dict[str, int]]:
+    memory_id_keys = [str(item) for item in _id_list(memory_ids)]
+    memory_id_to_idx = {artist_id: idx for idx, artist_id in enumerate(memory_id_keys)}
+    candidate_count = len(memory_id_keys)
+    valid_mask = torch.ones((candidate_count, candidate_count), dtype=torch.bool)
+
+    for row_idx, anchor_key in enumerate(memory_id_keys):
+        valid_mask[row_idx, row_idx] = False
+        if not positive_map:
+            continue
+        known_positives = positive_map.get(anchor_key, set())
+        for positive_id in known_positives:
+            positive_idx = memory_id_to_idx.get(str(positive_id))
+            if positive_idx is not None:
+                valid_mask[row_idx, positive_idx] = False
+
+    return valid_mask.to(device, non_blocking=True), memory_id_to_idx
+
+
+def _memory_bank_batch_valid_mask(
+    anchor_ids: Sequence[Any],
+    positive_ids: Sequence[Any],
+    *,
+    memory_id_to_idx: Mapping[str, int],
+    memory_valid_mask: Tensor,
+) -> Tensor:
+    anchor_keys = [str(item) for item in _id_list(anchor_ids)]
+    positive_keys = [str(item) for item in _id_list(positive_ids)]
+    if len(anchor_keys) != len(positive_keys):
+        raise ValueError("anchor_ids and positive_ids must have the same length")
+
+    device = memory_valid_mask.device
+    batch_size = len(anchor_keys)
+    candidate_count = int(memory_valid_mask.size(1))
+    anchor_indices = torch.tensor(
+        [memory_id_to_idx.get(anchor_key, -1) for anchor_key in anchor_keys],
+        device=device,
+        dtype=torch.long,
+    )
+    candidate_valid_mask = torch.zeros((batch_size, candidate_count), dtype=torch.bool, device=device)
+    valid_anchor_rows = anchor_indices >= 0
+    candidate_valid_mask[valid_anchor_rows] = memory_valid_mask.index_select(
+        0,
+        anchor_indices[valid_anchor_rows],
+    )
+
+    positive_indices = torch.tensor(
+        [memory_id_to_idx.get(positive_key, -1) for positive_key in positive_keys],
+        device=device,
+        dtype=torch.long,
+    )
+    valid_positive_rows = positive_indices >= 0
+    row_indices = torch.arange(batch_size, device=device, dtype=torch.long)
+    candidate_valid_mask[row_indices[valid_positive_rows], positive_indices[valid_positive_rows]] = False
+
+    return candidate_valid_mask
+
+
 def _encode_memory_bank(
     model,
-    memory_bank_tensors: Sequence[Tensor],
+    memory_inputs: Tensor,
     device: torch.device | str,
     *,
     batch_size: int,
+    amp_enabled: bool = False,
+    amp_dtype: torch.dtype = torch.float16,
 ) -> Tensor:
     """Encode all training artists once at the start of an epoch.
 
     The memory bank is used only to *select* hard negatives. Once a negative ID is
     selected, the selected negative is forwarded again with gradients enabled.
     """
-    memory_inputs = _stack_memory_bank_tensors(memory_bank_tensors)
     encoded_chunks: list[Tensor] = []
     was_training = bool(model.training)
     model.eval()
     with torch.inference_mode():
         for start in range(0, int(memory_inputs.size(0)), batch_size):
             chunk = memory_inputs[start : start + batch_size].to(device, non_blocking=True).float()
-            encoded_chunks.append(model.forward_once(chunk).detach())
+            with _autocast_context(device, amp_enabled, amp_dtype):
+                encoded_chunks.append(model.forward_once(chunk).detach())
     if was_training:
         model.train()
     return torch.cat(encoded_chunks, dim=0)
@@ -192,6 +317,10 @@ def train(
     memory_bank_ids: Sequence[Any] | None = None,
     memory_bank_tensors: Sequence[Tensor] | None = None,
     memory_bank_batch_size: int | None = None,
+    memory_bank_device_cache: bool | None = None,
+    amp_enabled: bool | None = None,
+    amp_dtype: torch.dtype | str = torch.float16,
+    scaler: Any | None = None,
 ):
     """Train one epoch on triplet batches.
 
@@ -209,6 +338,10 @@ def train(
     valid_modes = {"fixed", "random", "batch_semihard", "memory_bank_semihard"}
     if negative_mining not in valid_modes:
         raise ValueError(f"negative_mining must be one of: {sorted(valid_modes)}")
+
+    use_amp = _amp_is_enabled(device, amp_enabled)
+    resolved_amp_dtype = _resolve_amp_dtype(amp_dtype)
+    scaler = scaler if scaler is not None else _make_grad_scaler(use_amp)
 
     model.train()
     total_loss = 0.0
@@ -229,7 +362,10 @@ def train(
 
     memory_embeddings: Tensor | None = None
     memory_ids: Sequence[Any] | None = None
-    memory_tensor_by_id: dict[str, Tensor] = {}
+    memory_inputs_for_negative: Tensor | None = None
+    memory_valid_mask: Tensor | None = None
+    memory_id_to_idx: dict[str, int] = {}
+    memory_bank_cached_on_device = False
     if use_memory_bank_mining:
         if memory_bank_ids is None or memory_bank_tensors is None:
             raise ValueError(
@@ -239,9 +375,32 @@ def train(
         if len(memory_bank_ids) != len(memory_bank_tensors):
             raise ValueError("memory_bank_ids and memory_bank_tensors must have the same length")
         memory_ids = [str(item) for item in _id_list(memory_bank_ids)]
-        memory_tensor_by_id = {str(artist_id): tensor.float().cpu() for artist_id, tensor in zip(memory_ids, memory_bank_tensors)}
-        encode_bs = int(memory_bank_batch_size or max(1, getattr(train_loader, "batch_size", 128) or 128))
-        memory_embeddings = _encode_memory_bank(model, memory_bank_tensors, device, batch_size=encode_bs)
+        memory_inputs = _stack_memory_bank_tensors(memory_bank_tensors)
+        memory_bank_cached_on_device = _should_cache_memory_bank_on_device(
+            memory_inputs,
+            device,
+            memory_bank_device_cache,
+        )
+        memory_inputs_for_negative = (
+            memory_inputs.to(device, non_blocking=True)
+            if memory_bank_cached_on_device
+            else memory_inputs
+        )
+        memory_valid_mask, memory_id_to_idx = _build_memory_bank_valid_mask(
+            memory_ids,
+            positive_map,
+            device,
+        )
+        loader_batch_size = int(getattr(train_loader, "batch_size", 128) or 128)
+        encode_bs = int(memory_bank_batch_size or max(1024, loader_batch_size * 4))
+        memory_embeddings = _encode_memory_bank(
+            model,
+            memory_inputs_for_negative,
+            device,
+            batch_size=encode_bs,
+            amp_enabled=use_amp,
+            amp_dtype=resolved_amp_dtype,
+        )
         if int(memory_embeddings.size(0)) != len(memory_ids):
             raise RuntimeError("Encoded memory bank size does not match memory_bank_ids")
         model.train()
@@ -255,99 +414,122 @@ def train(
 
         optimizer.zero_grad(set_to_none=True)
 
-        if use_batch_mining:
-            if anchor_ids is None or positive_ids is None or negative_ids is None:
-                raise ValueError(
-                    "negative_mining='batch_semihard' requires batches with anchor, positive and negative artist IDs. "
-                    "Use create_triplets_with_ids(...) for the training loader."
-                )
-            anchor_embeddings, positive_embeddings, candidate_embeddings, candidate_ids = _encode_unique_artists(
-                model,
-                anchors,
-                positives,
-                negatives,
-                anchor_ids,
-                positive_ids,
-                negative_ids,
-            )
-            assert miner is not None
-            mined = miner.mine(
-                anchor_embeddings,
-                positive_embeddings,
-                candidate_embeddings,
-                anchor_ids,
-                positive_ids,
-                candidate_ids,
-                positive_map or {},
-            )
-            loss = mined["loss"]
-            valid_mask = mined["valid_mask"]
-            valid_count = int(valid_mask.sum().item())
-
-        elif use_memory_bank_mining:
-            if anchor_ids is None or positive_ids is None:
-                raise ValueError(
-                    "negative_mining='memory_bank_semihard' requires batches with anchor and positive artist IDs. "
-                    "Use create_triplets_with_ids(...) for the training loader."
-                )
-            if memory_embeddings is None or memory_ids is None:
-                raise RuntimeError("Memory bank was not initialized")
-
-            anchor_embeddings = model.forward_once(anchors)
-            positive_embeddings = model.forward_once(positives)
-            assert miner is not None
-            with torch.no_grad():
-                mined = miner.mine(
-                    anchor_embeddings.detach(),
-                    positive_embeddings.detach(),
-                    memory_embeddings,
+        with _autocast_context(device, use_amp, resolved_amp_dtype):
+            if use_batch_mining:
+                if anchor_ids is None or positive_ids is None or negative_ids is None:
+                    raise ValueError(
+                        "negative_mining='batch_semihard' requires batches with anchor, positive and negative artist IDs. "
+                        "Use create_triplets_with_ids(...) for the training loader."
+                    )
+                anchor_embeddings, positive_embeddings, candidate_embeddings, candidate_ids = _encode_unique_artists(
+                    model,
+                    anchors,
+                    positives,
+                    negatives,
                     anchor_ids,
                     positive_ids,
-                    memory_ids,
+                    negative_ids,
+                )
+                assert miner is not None
+                mined = miner.mine(
+                    anchor_embeddings,
+                    positive_embeddings,
+                    candidate_embeddings,
+                    anchor_ids,
+                    positive_ids,
+                    candidate_ids,
                     positive_map or {},
                 )
-            valid_mask = mined["valid_mask"].to(anchor_embeddings.device)
-            selected_positions, selected_negative_inputs = _selected_memory_tensors(
-                mined["selected_negative_ids"],
-                valid_mask,
-                memory_tensor_by_id,
-            )
-            valid_count = len(selected_positions)
-            if valid_count > 0 and selected_negative_inputs is not None:
-                row_indices = torch.tensor(selected_positions, device=anchor_embeddings.device, dtype=torch.long)
-                selected_anchor_embeddings = anchor_embeddings.index_select(0, row_indices)
-                selected_positive_embeddings = positive_embeddings.index_select(0, row_indices)
-                selected_negative_inputs = selected_negative_inputs.to(device, non_blocking=True).float()
-                selected_negative_embeddings = model.forward_once(selected_negative_inputs)
+                loss = mined["loss"]
+                valid_mask = mined["valid_mask"]
+                valid_count = int(valid_mask.sum().item())
 
-                positive_distance = _distance_pair(selected_anchor_embeddings, selected_positive_embeddings, distance_fn)
-                negative_distance = _distance_pair(selected_anchor_embeddings, selected_negative_embeddings, distance_fn)
-                losses = F.relu(positive_distance - negative_distance + margin)
-                loss = losses.mean()
-                triplet_acc = (positive_distance < negative_distance).float().mean()
-                margin_acc = (positive_distance + margin < negative_distance).float().mean()
+            elif use_memory_bank_mining:
+                if anchor_ids is None or positive_ids is None:
+                    raise ValueError(
+                        "negative_mining='memory_bank_semihard' requires batches with anchor and positive artist IDs. "
+                        "Use create_triplets_with_ids(...) for the training loader."
+                    )
+                if (
+                    memory_embeddings is None
+                    or memory_ids is None
+                    or memory_inputs_for_negative is None
+                    or memory_valid_mask is None
+                ):
+                    raise RuntimeError("Memory bank was not initialized")
+
+                anchor_embeddings = model.forward_once(anchors)
+                positive_embeddings = model.forward_once(positives)
+                candidate_valid_mask = _memory_bank_batch_valid_mask(
+                    anchor_ids,
+                    positive_ids,
+                    memory_id_to_idx=memory_id_to_idx,
+                    memory_valid_mask=memory_valid_mask,
+                )
+                assert miner is not None
+                with torch.no_grad():
+                    mined = miner.mine(
+                        anchor_embeddings.detach(),
+                        positive_embeddings.detach(),
+                        memory_embeddings,
+                        anchor_ids,
+                        positive_ids,
+                        memory_ids,
+                        positive_map=None,
+                        candidate_valid_mask=candidate_valid_mask,
+                        return_selected_ids=False,
+                    )
+                valid_mask = mined["valid_mask"].to(anchor_embeddings.device)
+                row_indices = valid_mask.nonzero(as_tuple=False).flatten()
+                selected_negative_indices = mined["selected_negative_indices"].to(
+                    memory_inputs_for_negative.device,
+                    non_blocking=True,
+                )
+                selected_negative_indices = selected_negative_indices[row_indices.to(selected_negative_indices.device)]
+                valid_count = int(row_indices.numel())
+                if valid_count > 0:
+                    selected_anchor_embeddings = anchor_embeddings.index_select(0, row_indices)
+                    selected_positive_embeddings = positive_embeddings.index_select(0, row_indices)
+                    selected_negative_inputs = memory_inputs_for_negative.index_select(0, selected_negative_indices)
+                    selected_negative_inputs = selected_negative_inputs.to(device, non_blocking=True).float()
+                    selected_negative_embeddings = model.forward_once(selected_negative_inputs)
+
+                    positive_distance = _distance_pair(selected_anchor_embeddings, selected_positive_embeddings, distance_fn)
+                    negative_distance = _distance_pair(selected_anchor_embeddings, selected_negative_embeddings, distance_fn)
+                    losses = F.relu(positive_distance - negative_distance + margin)
+                    loss = losses.mean()
+                    triplet_acc = (positive_distance < negative_distance).float().mean()
+                    margin_acc = (positive_distance + margin < negative_distance).float().mean()
+                else:
+                    # Keep the graph connected so backward() is still valid if an
+                    # unusually strict exclusion map leaves no candidate for a batch.
+                    loss = (anchor_embeddings.sum() + positive_embeddings.sum()) * 0.0
+                    positive_distance = torch.empty(0, device=anchor_embeddings.device, dtype=anchor_embeddings.dtype)
+                    negative_distance = torch.empty(0, device=anchor_embeddings.device, dtype=anchor_embeddings.dtype)
+                    triplet_acc = torch.zeros((), device=anchor_embeddings.device, dtype=anchor_embeddings.dtype)
+                    margin_acc = torch.zeros((), device=anchor_embeddings.device, dtype=anchor_embeddings.dtype)
+
             else:
-                # Keep the graph connected so backward() is still valid if an
-                # unusually strict exclusion map leaves no candidate for a batch.
-                loss = (anchor_embeddings.sum() + positive_embeddings.sum()) * 0.0
-                positive_distance = torch.empty(0, device=anchor_embeddings.device, dtype=anchor_embeddings.dtype)
-                negative_distance = torch.empty(0, device=anchor_embeddings.device, dtype=anchor_embeddings.dtype)
-                triplet_acc = torch.zeros((), device=anchor_embeddings.device, dtype=anchor_embeddings.dtype)
-                margin_acc = torch.zeros((), device=anchor_embeddings.device, dtype=anchor_embeddings.dtype)
-
-        else:
-            anchor_embeddings, positive_embeddings, negative_embeddings = model(anchors, positives, negatives)
-            loss = _as_scalar_loss(criterion(anchor_embeddings, positive_embeddings, negative_embeddings))
-            valid_count = batch_size
-            mined = None
+                anchor_embeddings, positive_embeddings, negative_embeddings = model(anchors, positives, negatives)
+                loss = _as_scalar_loss(criterion(anchor_embeddings, positive_embeddings, negative_embeddings))
+                valid_count = batch_size
+                mined = None
 
         if not torch.isfinite(loss):
             raise FloatingPointError(f"Non-finite training loss encountered: {loss.item()}")
 
-        loss.backward()
-        if grad_clip is not None and grad_clip > 0:
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=float(grad_clip))
-        optimizer.step()
+        if use_amp and scaler is not None:
+            scaler.scale(loss).backward()
+            if grad_clip is not None and grad_clip > 0:
+                scaler.unscale_(optimizer)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=float(grad_clip))
+            scaler.step(optimizer)
+            scaler.update()
+        else:
+            loss.backward()
+            if grad_clip is not None and grad_clip > 0:
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=float(grad_clip))
+            optimizer.step()
 
         if int(anchor_embeddings.size(0)) != batch_size:
             raise ValueError(
@@ -425,6 +607,8 @@ def train(
             "mean_neg_dist": neg_dist_total / metric_total if metric_total else 0.0,
             "negative_mining": negative_mining,
             "memory_bank_size": len(memory_ids) if memory_ids is not None else 0,
+            "memory_bank_cached_on_device": float(memory_bank_cached_on_device),
+            "amp_enabled": float(use_amp),
         }
     )
     if return_details:

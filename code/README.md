@@ -98,6 +98,12 @@ python code/experiment.py \
   --epochs 30
 ```
 
+The experiment entrypoint now defaults to GPU-throughput settings when CUDA is
+available: AMP, TF32/cuDNN benchmark, automatic DataLoader workers, larger
+memory-bank encoding batches, and automatic GPU caching for the memory-bank
+inputs when there is enough free VRAM. If VRAM is tight, lower `--batch-size` or
+set `--memory-bank-device-cache off`.
+
 ---
 
 ## Suggested thesis presentation angle

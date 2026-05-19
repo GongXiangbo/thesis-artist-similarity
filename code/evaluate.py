@@ -1,11 +1,44 @@
 from __future__ import annotations
 
+from contextlib import nullcontext
 from typing import Any
 
 import torch
 from torch import Tensor
 
 from metrics import DistanceName, triplet_correct_predictions
+
+
+def _device_type(device: torch.device | str) -> str:
+    return torch.device(device).type
+
+
+def _amp_is_enabled(device: torch.device | str, enabled: bool | None) -> bool:
+    if enabled is None:
+        enabled = True
+    return bool(enabled) and _device_type(device) == "cuda"
+
+
+def _resolve_amp_dtype(dtype: torch.dtype | str) -> torch.dtype:
+    if isinstance(dtype, torch.dtype):
+        return dtype
+    normalised = str(dtype).lower().replace("torch.", "")
+    if normalised in {"float16", "fp16", "half"}:
+        return torch.float16
+    if normalised in {"bfloat16", "bf16"}:
+        return torch.bfloat16
+    raise ValueError("amp_dtype must be 'float16'/'fp16' or 'bfloat16'/'bf16'")
+
+
+def _autocast_context(device: torch.device | str, enabled: bool, dtype: torch.dtype):
+    if not enabled:
+        return nullcontext()
+    device_type = _device_type(device)
+    if hasattr(torch, "autocast"):
+        return torch.autocast(device_type=device_type, dtype=dtype, enabled=True)
+    if device_type == "cuda":
+        return torch.cuda.amp.autocast(dtype=dtype, enabled=True)
+    return nullcontext()
 
 
 def _move_batch_to_device(batch: tuple[Tensor, Tensor, Tensor], device: torch.device | str) -> tuple[Tensor, Tensor, Tensor]:
@@ -57,6 +90,8 @@ def evaluate(
     distance_fn: DistanceName = "cosine",
     *,
     return_details: bool = False,
+    amp_enabled: bool | None = None,
+    amp_dtype: torch.dtype | str = torch.float16,
 ):
     """Evaluate triplet batches without gradient calculation.
 
@@ -69,12 +104,15 @@ def evaluate(
     margin_correct = 0
     total = 0
     margin = _criterion_margin(criterion)
+    use_amp = _amp_is_enabled(device, amp_enabled)
+    resolved_amp_dtype = _resolve_amp_dtype(amp_dtype)
 
     with torch.inference_mode():
         for batch in val_loader:
             anchors, positives, negatives = _move_batch_to_device(batch, device)
-            anchor_embeddings, positive_embeddings, negative_embeddings = model(anchors, positives, negatives)
-            loss = _as_scalar_loss(criterion(anchor_embeddings, positive_embeddings, negative_embeddings))
+            with _autocast_context(device, use_amp, resolved_amp_dtype):
+                anchor_embeddings, positive_embeddings, negative_embeddings = model(anchors, positives, negatives)
+                loss = _as_scalar_loss(criterion(anchor_embeddings, positive_embeddings, negative_embeddings))
             if not torch.isfinite(loss):
                 raise FloatingPointError(f"Non-finite validation loss encountered: {loss.item()}")
 
