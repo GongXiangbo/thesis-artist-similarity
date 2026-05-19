@@ -141,8 +141,8 @@ class BatchSemiHardNegativeMiner:
         if candidate_id_count != candidate_count:
             raise ValueError("candidate_ids must match candidate_emb rows")
 
-        pos_dist = self._pair_distance(anchor_emb, positive_emb)
-        distance_matrix = self._distance_matrix(anchor_emb, candidate_emb)
+        pos_dist = self._pair_distance(anchor_emb, positive_emb).float()
+        distance_matrix = self._distance_matrix(anchor_emb, candidate_emb).float()
 
         if candidate_valid_mask is not None:
             if tuple(candidate_valid_mask.shape) != (batch_size, candidate_count):
