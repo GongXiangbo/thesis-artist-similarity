@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-from contextlib import nullcontext
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -32,8 +31,8 @@ class FoldTrainingConfig:
     model_kwargs: dict[str, Any]
     output_dir: Path
     device: torch.device | str
-    batch_size: int = 64
-    num_workers: int = -1
+    batch_size: int = 128
+    num_workers: int = 0
     num_epochs: int = 30
     learning_rate: float = 2e-4
     weight_decay: float = 1e-6
@@ -42,10 +41,6 @@ class FoldTrainingConfig:
     negative_mining: NegativeMiningMode = "memory_bank_semihard"
     mining_fallback: str = "closest_valid"
     grad_clip: float | None = 1.0
-    memory_bank_batch_size: int | None = None
-    memory_bank_device_cache: bool | None = None
-    amp_enabled: bool | None = None
-    amp_dtype: torch.dtype | str = torch.float16
 
 
 def _normalise_triplet_df(df: pd.DataFrame) -> pd.DataFrame:
@@ -225,45 +220,7 @@ def _make_criterion(margin: float, distance_fn: DistanceName):
 
 
 def _state_dict_to_cpu(model: nn.Module) -> dict[str, torch.Tensor]:
-    state_source = getattr(model, "_orig_mod", model)
-    return {name: tensor.detach().cpu().clone() for name, tensor in state_source.state_dict().items()}
-
-
-def _amp_is_enabled(device: torch.device | str, enabled: bool | None) -> bool:
-    if enabled is None:
-        enabled = True
-    return bool(enabled) and torch.device(device).type == "cuda"
-
-
-def _resolve_amp_dtype(dtype: torch.dtype | str) -> torch.dtype:
-    if isinstance(dtype, torch.dtype):
-        return dtype
-    normalised = str(dtype).lower().replace("torch.", "")
-    if normalised in {"float16", "fp16", "half"}:
-        return torch.float16
-    if normalised in {"bfloat16", "bf16"}:
-        return torch.bfloat16
-    raise ValueError("amp_dtype must be 'float16'/'fp16' or 'bfloat16'/'bf16'")
-
-
-def _make_grad_scaler(enabled: bool):
-    if not enabled:
-        return None
-    try:
-        return torch.amp.GradScaler("cuda", enabled=True)
-    except (AttributeError, TypeError):
-        return torch.cuda.amp.GradScaler(enabled=True)
-
-
-def _autocast_context(device: torch.device | str, enabled: bool, dtype: torch.dtype):
-    if not enabled:
-        return nullcontext()
-    device_type = torch.device(device).type
-    if hasattr(torch, "autocast"):
-        return torch.autocast(device_type=device_type, dtype=dtype, enabled=True)
-    if device_type == "cuda":
-        return torch.cuda.amp.autocast(dtype=dtype, enabled=True)
-    return nullcontext()
+    return {name: tensor.detach().cpu().clone() for name, tensor in model.state_dict().items()}
 
 
 @torch.inference_mode()
@@ -272,10 +229,6 @@ def _compute_validation_retrieval_mrr(
     val_df: pd.DataFrame,
     artist_averages: dict[str, torch.Tensor],
     device: torch.device | str,
-    *,
-    batch_size: int = 1024,
-    amp_enabled: bool | None = None,
-    amp_dtype: torch.dtype | str = torch.float16,
 ) -> float:
     """Compute retrieval-style MRR on the validation artist subgraph.
 
@@ -309,20 +262,16 @@ def _compute_validation_retrieval_mrr(
 
     was_training = bool(model.training)
     model.eval()
-    input_tensors = torch.stack([artist_averages[artist_id].float() for artist_id in available_ids], dim=0)
     embeddings: list[torch.Tensor] = []
-    use_amp = _amp_is_enabled(device, amp_enabled)
-    resolved_amp_dtype = _resolve_amp_dtype(amp_dtype)
-    for start in range(0, int(input_tensors.size(0)), batch_size):
-        tensor = input_tensors[start : start + batch_size].to(device, non_blocking=True).float()
-        with _autocast_context(device, use_amp, resolved_amp_dtype):
-            emb = model.forward_once(tensor).detach().float()
+    for artist_id in available_ids:
+        tensor = artist_averages[artist_id].unsqueeze(0).to(device).float()
+        emb = model.forward_once(tensor).detach().float()
         emb = torch.nn.functional.normalize(emb, dim=1, eps=1e-8)
-        embeddings.append(emb.cpu())
+        embeddings.append(emb.squeeze(0).cpu())
     if was_training:
         model.train()
 
-    matrix = torch.cat(embeddings, dim=0)
+    matrix = torch.stack(embeddings, dim=0)
     similarity = (matrix @ matrix.T).numpy()
     np.fill_diagonal(similarity, -np.inf)
     id_to_idx = {artist_id: idx for idx, artist_id in enumerate(available_ids)}
@@ -387,8 +336,6 @@ def run_one_fold_margin(
         factor=0.7,
         patience=3,
     )
-    use_amp = _amp_is_enabled(config.device, config.amp_enabled)
-    scaler = _make_grad_scaler(use_amp)
 
     best_val_mrr = -1.0
     best_val_acc = -1.0
@@ -414,11 +361,7 @@ def run_one_fold_margin(
             mining_fallback=config.mining_fallback,
             memory_bank_ids=memory_bank_ids,
             memory_bank_tensors=memory_bank_tensors,
-            memory_bank_batch_size=config.memory_bank_batch_size,
-            memory_bank_device_cache=config.memory_bank_device_cache,
-            amp_enabled=use_amp,
-            amp_dtype=config.amp_dtype,
-            scaler=scaler,
+            memory_bank_batch_size=config.batch_size,
         )
         val_metrics = evaluate(
             model,
@@ -427,18 +370,8 @@ def run_one_fold_margin(
             config.device,
             distance_fn=config.distance_fn,
             return_details=True,
-            amp_enabled=use_amp,
-            amp_dtype=config.amp_dtype,
         )
-        val_mrr = _compute_validation_retrieval_mrr(
-            model,
-            val_df,
-            artist_averages,
-            config.device,
-            batch_size=max(1024, config.batch_size * 4),
-            amp_enabled=use_amp,
-            amp_dtype=config.amp_dtype,
-        )
+        val_mrr = _compute_validation_retrieval_mrr(model, val_df, artist_averages, config.device)
         scheduler.step(val_metrics["loss"])
 
         lr = optimizer.param_groups[0]["lr"]
@@ -462,8 +395,6 @@ def run_one_fold_margin(
             "mean_pos_dist": train_metrics.get("mean_pos_dist", 0.0),
             "mean_neg_dist": train_metrics.get("mean_neg_dist", 0.0),
             "memory_bank_size": train_metrics.get("memory_bank_size", 0),
-            "memory_bank_cached_on_device": train_metrics.get("memory_bank_cached_on_device", 0.0),
-            "amp_enabled": train_metrics.get("amp_enabled", 0.0),
             "lr": lr,
         }
         history.append(row)

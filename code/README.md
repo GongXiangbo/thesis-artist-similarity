@@ -98,16 +98,6 @@ python code/experiment.py \
   --epochs 30
 ```
 
-The experiment entrypoint now keeps training quality first: the effective
-training batch defaults to `64`, AMP is enabled automatically on CUDA for
-practical training speed, TF32 is off by default, and deterministic kernels are
-enabled. GPU-safe throughput improvements remain in place where they do not
-change the training batch, including automatic DataLoader workers, larger
-no-gradient memory-bank encoding batches, and automatic GPU caching for
-memory-bank inputs when there is enough free VRAM. For strict full-precision
-final checks, explicitly pass `--amp off`; for a speed-oriented run, add
-`--allow-tf32 --no-deterministic`.
-
 ---
 
 ## Suggested thesis presentation angle
