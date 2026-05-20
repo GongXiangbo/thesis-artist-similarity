@@ -44,7 +44,7 @@ class FoldTrainingConfig:
     grad_clip: float | None = 1.0
     memory_bank_batch_size: int | None = None
     memory_bank_device_cache: bool | None = None
-    amp_enabled: bool | None = False
+    amp_enabled: bool | None = None
     amp_dtype: torch.dtype | str = torch.float16
 
 

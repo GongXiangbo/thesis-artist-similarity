@@ -60,7 +60,7 @@ def parse_args():
         choices=["auto", "on", "off"],
         help="Cache memory-bank input tensors on the GPU when possible.",
     )
-    parser.add_argument("--amp", type=str, default="off", choices=["auto", "on", "off"])
+    parser.add_argument("--amp", type=str, default="auto", choices=["auto", "on", "off"])
     parser.add_argument("--amp-dtype", type=str, default="float16", choices=["float16", "bfloat16"])
     parser.add_argument("--matmul-precision", type=str, default="high", choices=["highest", "high", "medium"])
     parser.add_argument("--deterministic", action=argparse.BooleanOptionalAction, default=True)
