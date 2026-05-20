@@ -6,9 +6,10 @@ needs a more stable artist-level representation.
 
 TripletNet1 structure:
     input
-    -> LayerNorm + 1x1 Conv projection
-    -> residual multi-scale dilated 1D-CNN / TCN blocks
-    -> hybrid pooling: attentive mean + attentive std + mean + max
+    -> LayerNorm + Linear projection
+    -> learnable CLS token + learnable positional embedding
+    -> 2-layer pre-norm Transformer encoder
+    -> hybrid pooling: CLS + attentive mean + attentive std + mean + max
     -> MLP projection head
     -> L2-normalised embedding
 
@@ -304,231 +305,6 @@ class HybridTransformerTripletNet(BaseTripletNet):
         return F.normalize(x, dim=1, eps=1e-8)
 
 
-
-class ResidualDilatedConvBlock(nn.Module):
-    """Residual multi-scale 1D-CNN / TCN block for short high-dimensional sequences.
-
-    The block keeps the sequence length unchanged by using dilation-aware padding.
-    Optional max pooling can be applied after the residual connection to downsample
-    the temporal/post dimension.
-    """
-
-    def __init__(
-        self,
-        in_channels: int,
-        out_channels: int,
-        kernel_size: int = 3,
-        dilation: int = 1,
-        dropout: float = 0.2,
-        pool: bool = False,
-    ) -> None:
-        super().__init__()
-
-        if in_channels <= 0 or out_channels <= 0:
-            raise ValueError("in_channels and out_channels must be positive")
-
-        if kernel_size <= 0 or kernel_size % 2 == 0:
-            raise ValueError("kernel_size must be a positive odd integer")
-
-        if dilation <= 0:
-            raise ValueError("dilation must be positive")
-
-        padding = dilation * (kernel_size // 2)
-
-        self.conv1 = nn.Conv1d(
-            in_channels=in_channels,
-            out_channels=out_channels,
-            kernel_size=kernel_size,
-            padding=padding,
-            dilation=dilation,
-        )
-        self.norm1 = _make_group_norm(out_channels)
-        self.act1 = nn.PReLU(num_parameters=out_channels)
-        self.dropout = nn.Dropout(dropout)
-
-        self.conv2 = nn.Conv1d(
-            in_channels=out_channels,
-            out_channels=out_channels,
-            kernel_size=kernel_size,
-            padding=padding,
-            dilation=dilation,
-        )
-        self.norm2 = _make_group_norm(out_channels)
-        self.act2 = nn.PReLU(num_parameters=out_channels)
-
-        if in_channels == out_channels:
-            self.shortcut = nn.Identity()
-        else:
-            self.shortcut = nn.Conv1d(in_channels, out_channels, kernel_size=1)
-
-        self.pool = nn.MaxPool1d(kernel_size=2, stride=2, ceil_mode=True) if pool else nn.Identity()
-
-        self._init_weights()
-
-    def _init_weights(self) -> None:
-        for module in self.modules():
-            if isinstance(module, nn.Conv1d):
-                nn.init.kaiming_normal_(module.weight, nonlinearity="leaky_relu")
-                if module.bias is not None:
-                    nn.init.zeros_(module.bias)
-
-    def forward(self, x: Tensor) -> Tensor:
-        residual = self.shortcut(x)
-
-        out = self.conv1(x)
-        out = self.norm1(out)
-        out = self.act1(out)
-        out = self.dropout(out)
-        out = self.conv2(out)
-        out = self.norm2(out)
-
-        out = self.act2(out + residual)
-        return self.pool(out)
-
-
-class ResidualMultiScaleConvTripletNet(BaseTripletNet):
-    """TripletNet1-V2 backbone.
-
-    This replaces the Transformer/CLS-token encoder with a residual multi-scale
-    dilated 1D-CNN / TCN encoder. It is designed for fixed-length artist/post/frame
-    embeddings where global retrieval quality benefits from stable artist-level pooling.
-    """
-
-    def __init__(
-        self,
-        d_model: int = DEFAULT_EMBEDDING_DIM,
-        output_dim: int = DEFAULT_OUTPUT_DIM,
-        max_seq_len: int = DEFAULT_MAX_SEQ_LEN,
-        conv_dim: int = 256,
-        dropout: float = 0.2,
-        projection_hidden_dim: int = 512,
-    ) -> None:
-        super().__init__()
-
-        if d_model <= 0 or output_dim <= 0 or max_seq_len <= 0:
-            raise ValueError("d_model, output_dim and max_seq_len must be positive")
-
-        if conv_dim <= 0 or projection_hidden_dim <= 0:
-            raise ValueError("conv_dim and projection_hidden_dim must be positive")
-
-        self.d_model = d_model
-        self.output_dim = output_dim
-        self.max_seq_len = max_seq_len
-        self.conv_dim = conv_dim
-        final_channels = 128
-
-        self.input_norm = nn.LayerNorm(d_model)
-        self.input_projection = nn.Conv1d(
-            in_channels=d_model,
-            out_channels=conv_dim,
-            kernel_size=1,
-        )
-        self.input_projection_norm = _make_group_norm(conv_dim)
-        self.input_projection_act = nn.PReLU(num_parameters=conv_dim)
-        self.input_dropout = nn.Dropout(dropout * 0.5)
-
-        self.encoder = nn.Sequential(
-            ResidualDilatedConvBlock(
-                in_channels=conv_dim,
-                out_channels=conv_dim,
-                kernel_size=3,
-                dilation=1,
-                dropout=dropout,
-                pool=False,
-            ),
-            ResidualDilatedConvBlock(
-                in_channels=conv_dim,
-                out_channels=conv_dim,
-                kernel_size=5,
-                dilation=1,
-                dropout=dropout,
-                pool=True,
-            ),
-            ResidualDilatedConvBlock(
-                in_channels=conv_dim,
-                out_channels=final_channels,
-                kernel_size=3,
-                dilation=2,
-                dropout=dropout,
-                pool=False,
-            ),
-            ResidualDilatedConvBlock(
-                in_channels=final_channels,
-                out_channels=final_channels,
-                kernel_size=5,
-                dilation=4,
-                dropout=dropout,
-                pool=False,
-            ),
-        )
-
-        self.attentive_pool = AttentiveStatsPool(
-            d_model=final_channels,
-            hidden_dim=min(256, max(64, final_channels)),
-        )
-
-        pooled_dim = final_channels * 4
-        mid_dim = max(output_dim, projection_hidden_dim // 2)
-
-        self.projection = nn.Sequential(
-            nn.LayerNorm(pooled_dim),
-            nn.Linear(pooled_dim, projection_hidden_dim),
-            nn.GELU(),
-            nn.Dropout(dropout),
-            nn.Linear(projection_hidden_dim, mid_dim),
-            nn.GELU(),
-            nn.Dropout(dropout * 0.5),
-            nn.Linear(mid_dim, output_dim),
-        )
-
-        self._init_weights()
-
-    def _init_weights(self) -> None:
-        nn.init.kaiming_normal_(self.input_projection.weight, nonlinearity="leaky_relu")
-        if self.input_projection.bias is not None:
-            nn.init.zeros_(self.input_projection.bias)
-
-        for module in self.projection.modules():
-            if isinstance(module, nn.Linear):
-                _init_linear(module)
-
-    def encode(self, x: Tensor) -> Tensor:
-        if x.ndim != 3:
-            raise ValueError(f"Expected input shape (batch, seq_len, dim), got {tuple(x.shape)}")
-
-        if x.size(1) > self.max_seq_len:
-            raise ValueError(f"Input sequence length {x.size(1)} exceeds max_seq_len {self.max_seq_len}")
-
-        if x.size(2) != self.d_model:
-            raise ValueError(f"Input feature dim {x.size(2)} does not match d_model {self.d_model}")
-
-        x = self.input_norm(x.float())
-        x = x.transpose(1, 2)
-        x = self.input_projection(x)
-        x = self.input_projection_norm(x)
-        x = self.input_projection_act(x)
-        x = self.input_dropout(x)
-
-        x = self.encoder(x)
-        x = x.transpose(1, 2)
-
-        attentive_stats = self.attentive_pool(x)
-        mean_pool = x.mean(dim=1)
-        max_pool = x.amax(dim=1)
-
-        pooled = torch.cat(
-            [
-                attentive_stats,
-                mean_pool,
-                max_pool,
-            ],
-            dim=1,
-        )
-
-        x = self.projection(pooled)
-        return F.normalize(x, dim=1, eps=1e-8)
-
-
 class ConvTripletNet(BaseTripletNet):
     def __init__(
         self,
@@ -652,13 +428,7 @@ class ConvTripletNet(BaseTripletNet):
         return F.normalize(x, dim=1, eps=1e-8)
 
 
-class TripletNet1(ResidualMultiScaleConvTripletNet):
-    """Recommended TripletNet1-V2 architecture.
-
-    Keeps the original class name and constructor compatibility, but replaces the
-    Transformer encoder with a residual multi-scale dilated 1D-CNN / TCN encoder.
-    """
-
+class TripletNet1(HybridTransformerTripletNet):
     def __init__(
         self,
         d_model: int = DEFAULT_EMBEDDING_DIM,
@@ -670,9 +440,10 @@ class TripletNet1(ResidualMultiScaleConvTripletNet):
             d_model=d_model,
             max_seq_len=max_seq_len if seq_len is None else seq_len,
             output_dim=output_dim,
-            conv_dim=256,
-            dropout=0.2,
-            projection_hidden_dim=512,
+            model_dim=_choose_transformer_dim(d_model, preferred=512),
+            nhead=None,
+            num_layers=2,
+            dropout=0.15,
         )
 
 
