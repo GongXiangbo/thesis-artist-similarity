@@ -14,7 +14,7 @@ python code/experiment.py --model TripletNet1 --margin 0.5 --epochs 30
 ```
 
 By default it reads embeddings from `data/video_embeddings`, triplets from
-`data/triplets/triplets_ids_spot.csv`, and writes checkpoints to
+`data/triplets/triplets_ids_music_spot.csv`, and writes checkpoints to
 `results/checkpoints`.
 
 ## Hard-negative mining and safer negative sampling

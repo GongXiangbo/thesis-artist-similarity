@@ -42,7 +42,7 @@ def resolve_project_path(path_value: str) -> Path:
 def parse_args():
     parser = argparse.ArgumentParser()
     parser.add_argument("--base-dir", type=str, default="data/video_embeddings")
-    parser.add_argument("--triplets-csv", type=str, default="data/triplets/triplets_ids_spot.csv")
+    parser.add_argument("--triplets-csv", type=str, default="data/triplets/triplets_ids_music_spot.csv")
     parser.add_argument("--model", type=str, default="TripletNet1")
     parser.add_argument("--epochs", type=int, default=30)
     parser.add_argument("--batch-size", type=int, default=128)

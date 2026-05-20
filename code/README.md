@@ -14,6 +14,7 @@ This version keeps your original research direction and model definitions, but r
    - Replaced repeated forward logic with reusable base classes.
    - Added a model registry and `build_model(...)`.
    - Removed hard-coded fully connected input sizes by inferring them automatically.
+   - Replaced `TripletNet1` with a dual-branch CLIP-frame aggregator: frame-level L2 normalisation, 768→384 projection, Set/Style attention branch, 2-layer Temporal Transformer branch, optional temporal-delta branch, gated fusion, and 512→256 projection head.
 
 3. **Refactored `dataset.py`**
    - Removed CLIP loading at import time.
@@ -68,21 +69,11 @@ The previous anchor-only protocol is not recommended for final reporting because
 
 ---
 
-## Which model looked best from your existing notebooks
+## Important note about existing notebook results
 
-Based on the saved notebook outputs in this project:
-
-- **Best overall:** `TripletNet1`
-- **Best recorded validation accuracy:** **98.13%**
-- **Best margin in the saved notebook output:** **0.5**
-
-Other strong results:
-- `TripletNet4`: 97.56%
-- `TripletNet5`: 97.56%
-- `TripletNet3`: 97.40%
-- `TripletNet2`: 96.83%
-
-So if your thesis needs **one best model**, I recommend using **TripletNet1** as the primary model and presenting the others as comparative baselines.
+`TripletNet1` has been replaced with the new dual-branch CLIP-frame architecture.
+The old saved outputs in `model1.ipynb` correspond to the previous TripletNet1 implementation and should be treated only as historical experiment records.
+After this change, rerun the margin grid and compare models again before reporting final thesis results.
 
 ---
 
@@ -91,9 +82,9 @@ So if your thesis needs **one best model**, I recommend using **TripletNet1** as
 ```bash
 python code/experiment.py \
   --base-dir data/video_embeddings \
-  --triplets-csv data/triplets/triplets_ids_spot.csv \
+  --triplets-csv data/triplets/triplets_ids_music_spot.csv \
   --model TripletNet1 \
-  --margin 0.5 \
+  --margin 0.1 \
   --negative-mining memory_bank_semihard \
   --epochs 30
 ```

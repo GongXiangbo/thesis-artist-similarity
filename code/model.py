@@ -1,17 +1,19 @@
-"""Model definitions for triplet learning on fixed-length frame embeddings.
+"""Model definitions for triplet learning on fixed-length CLIP frame embeddings.
 
-TripletNet1 is the main model. It is optimised for the current result pattern:
-triplet-level ranking is already very strong, but global nearest-neighbour retrieval
-needs a more stable artist-level representation.
+The CLIP image encoder is assumed to be frozen before this file is used: the
+training pipeline consumes precomputed per-frame CLIP embeddings, normally shaped
+``(30, 768)`` for each video/artist representation.
 
 TripletNet1 structure:
-    input
-    -> LayerNorm + Linear projection
-    -> learnable CLS token + learnable positional embedding
-    -> 2-layer pre-norm Transformer encoder
-    -> hybrid pooling: CLS + attentive mean + attentive std + mean + max
-    -> MLP projection head
-    -> L2-normalised embedding
+    input CLIP frame embeddings
+    -> frame-level L2 normalisation
+    -> shared 768 -> 384 projection adapter
+    -> Set/Style branch without positional encoding
+    -> 2-layer Temporal Transformer branch with positional encoding
+    -> optional temporal-delta branch
+    -> gated fusion
+    -> 512 -> 256 projection head
+    -> final L2-normalised video/artist embedding
 
 All models receive tensors shaped:
     (batch, seq_len, d_model)
@@ -305,6 +307,227 @@ class HybridTransformerTripletNet(BaseTripletNet):
         return F.normalize(x, dim=1, eps=1e-8)
 
 
+
+class DualBranchCLIPTripletNet(BaseTripletNet):
+    """Dual-branch aggregator for precomputed CLIP frame embeddings.
+
+    The CLIP encoder is not trained here. It is expected to have been used offline
+    to produce a sequence of frame embeddings. This network learns only how to
+    aggregate those frozen frame embeddings into a retrieval-ready representation.
+    """
+
+    def __init__(
+        self,
+        d_model: int = DEFAULT_EMBEDDING_DIM,
+        output_dim: int = DEFAULT_OUTPUT_DIM,
+        max_seq_len: int = DEFAULT_MAX_SEQ_LEN,
+        model_dim: int = 384,
+        nhead: int = 8,
+        num_layers: int = 2,
+        dropout: float = 0.15,
+        dim_feedforward: int | None = None,
+        projection_hidden_dim: int = 512,
+        use_delta_branch: bool = True,
+    ) -> None:
+        super().__init__()
+
+        if d_model <= 0 or output_dim <= 0 or max_seq_len <= 0 or model_dim <= 0:
+            raise ValueError("d_model, output_dim, max_seq_len and model_dim must be positive")
+        if num_layers <= 0:
+            raise ValueError("num_layers must be positive")
+        if nhead <= 0 or model_dim % nhead != 0:
+            raise ValueError(f"nhead={nhead} must be positive and divide model_dim={model_dim}")
+        if projection_hidden_dim <= 0:
+            raise ValueError("projection_hidden_dim must be positive")
+
+        self.d_model = d_model
+        self.model_dim = model_dim
+        self.output_dim = output_dim
+        self.max_seq_len = max_seq_len
+        self.use_delta_branch = use_delta_branch
+
+        # Shared CLIP-frame adapter: 768 -> 384 by default.
+        # The input is first L2-normalised per frame because CLIP embeddings are
+        # usually compared by cosine similarity.
+        self.frame_projection = nn.Sequential(
+            nn.LayerNorm(d_model),
+            nn.Linear(d_model, model_dim),
+            nn.GELU(),
+            nn.Dropout(dropout * 0.5),
+            nn.LayerNorm(model_dim),
+        )
+
+        # Branch A: set/style branch. No positional encoding is used here so the
+        # model can learn the order-invariant visual/content style distribution of
+        # the sampled frames.
+        self.set_attentive_pool = AttentiveStatsPool(
+            d_model=model_dim,
+            hidden_dim=min(256, max(64, model_dim // 2)),
+        )
+        self.set_projection = nn.Sequential(
+            nn.LayerNorm(model_dim * 4),
+            nn.Linear(model_dim * 4, model_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.LayerNorm(model_dim),
+        )
+
+        # Branch B: temporal branch. This keeps the equal-interval frame order.
+        self.cls_token = nn.Parameter(torch.empty(1, 1, model_dim))
+        self.pos_encoder = LearnedPositionalEncoding(
+            d_model=model_dim,
+            max_len=max_seq_len + 1,
+            dropout=dropout,
+        )
+
+        if dim_feedforward is None:
+            dim_feedforward = 4 * model_dim
+
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=model_dim,
+            nhead=nhead,
+            dim_feedforward=dim_feedforward,
+            dropout=dropout,
+            activation="gelu",
+            batch_first=True,
+            norm_first=True,
+        )
+        self.temporal_encoder = nn.TransformerEncoder(
+            encoder_layer=encoder_layer,
+            num_layers=num_layers,
+        )
+        self.temporal_attentive_pool = AttentiveStatsPool(
+            d_model=model_dim,
+            hidden_dim=min(256, max(64, model_dim // 2)),
+        )
+        self.temporal_projection = nn.Sequential(
+            nn.LayerNorm(model_dim * 5),
+            nn.Linear(model_dim * 5, model_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.LayerNorm(model_dim),
+        )
+
+        # Optional branch C: temporal delta. It encodes semantic changes between
+        # adjacent sampled frames, which is useful when the video contains scene
+        # changes, motion cues, editing rhythm, or narrative progression.
+        if use_delta_branch:
+            self.delta_attentive_pool = AttentiveStatsPool(
+                d_model=model_dim,
+                hidden_dim=min(256, max(64, model_dim // 2)),
+            )
+            self.delta_projection = nn.Sequential(
+                nn.LayerNorm(model_dim * 4),
+                nn.Linear(model_dim * 4, model_dim),
+                nn.GELU(),
+                nn.Dropout(dropout),
+                nn.LayerNorm(model_dim),
+            )
+            gate_input_dim = model_dim * 3
+            gate_outputs = 3
+        else:
+            self.delta_attentive_pool = None
+            self.delta_projection = None
+            gate_input_dim = model_dim * 2
+            gate_outputs = 2
+
+        # Gated fusion learns whether each sample should rely more on global style,
+        # temporal ordering, or frame-to-frame semantic change.
+        self.fusion_gate = nn.Sequential(
+            nn.LayerNorm(gate_input_dim),
+            nn.Linear(gate_input_dim, model_dim),
+            nn.GELU(),
+            nn.Dropout(dropout * 0.5),
+            nn.Linear(model_dim, gate_outputs),
+        )
+
+        # Projection head: 384 -> 512 -> 256 by default.
+        self.projection_head = nn.Sequential(
+            nn.LayerNorm(model_dim),
+            nn.Linear(model_dim, projection_hidden_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(projection_hidden_dim, output_dim),
+        )
+
+        self._init_weights()
+
+    def _init_weights(self) -> None:
+        nn.init.trunc_normal_(self.cls_token, std=0.02)
+        for module in self.modules():
+            if isinstance(module, nn.Linear):
+                _init_linear(module)
+
+    @staticmethod
+    def _pool_set_like(x: Tensor, attentive_pool: AttentiveStatsPool) -> Tensor:
+        attentive_stats = attentive_pool(x)
+        mean_pool = x.mean(dim=1)
+        max_pool = x.amax(dim=1)
+        return torch.cat([attentive_stats, mean_pool, max_pool], dim=1)
+
+    def _encode_set_branch(self, x: Tensor) -> Tensor:
+        pooled = self._pool_set_like(x, self.set_attentive_pool)
+        return self.set_projection(pooled)
+
+    def _encode_temporal_branch(self, x: Tensor) -> Tensor:
+        cls = self.cls_token.expand(x.size(0), -1, -1)
+        tokens = torch.cat([cls, x], dim=1)
+        tokens = self.pos_encoder(tokens)
+        tokens = self.temporal_encoder(tokens)
+
+        cls_out = tokens[:, 0]
+        frame_tokens = tokens[:, 1:]
+        attentive_stats = self.temporal_attentive_pool(frame_tokens)
+        mean_pool = frame_tokens.mean(dim=1)
+        max_pool = frame_tokens.amax(dim=1)
+        pooled = torch.cat([cls_out, attentive_stats, mean_pool, max_pool], dim=1)
+        return self.temporal_projection(pooled)
+
+    def _encode_delta_branch(self, x: Tensor) -> Tensor:
+        if not self.use_delta_branch or self.delta_attentive_pool is None or self.delta_projection is None:
+            raise RuntimeError("delta branch is disabled")
+
+        if x.size(1) < 2:
+            return x.new_zeros(x.size(0), self.model_dim)
+
+        deltas = x[:, 1:, :] - x[:, :-1, :]
+        pooled = self._pool_set_like(deltas, self.delta_attentive_pool)
+        return self.delta_projection(pooled)
+
+    def encode(self, x: Tensor) -> Tensor:
+        if x.ndim != 3:
+            raise ValueError(f"Expected input shape (batch, seq_len, dim), got {tuple(x.shape)}")
+        if x.size(1) > self.max_seq_len:
+            raise ValueError(f"Input sequence length {x.size(1)} exceeds max_seq_len {self.max_seq_len}")
+        if x.size(2) != self.d_model:
+            raise ValueError(f"Input feature dim {x.size(2)} does not match d_model {self.d_model}")
+
+        # Frozen CLIP frame embeddings are already precomputed. This layer performs
+        # frame-level cosine normalisation before the learnable aggregation network.
+        x = F.normalize(x.float(), dim=2, eps=1e-8)
+        x = self.frame_projection(x)
+
+        set_embedding = self._encode_set_branch(x)
+        temporal_embedding = self._encode_temporal_branch(x)
+
+        if self.use_delta_branch:
+            delta_embedding = self._encode_delta_branch(x)
+            gate_input = torch.cat([set_embedding, temporal_embedding, delta_embedding], dim=1)
+            weights = torch.softmax(self.fusion_gate(gate_input), dim=1)
+            fused = (
+                weights[:, 0:1] * set_embedding
+                + weights[:, 1:2] * temporal_embedding
+                + weights[:, 2:3] * delta_embedding
+            )
+        else:
+            gate_input = torch.cat([set_embedding, temporal_embedding], dim=1)
+            weights = torch.softmax(self.fusion_gate(gate_input), dim=1)
+            fused = weights[:, 0:1] * set_embedding + weights[:, 1:2] * temporal_embedding
+
+        x = self.projection_head(fused)
+        return F.normalize(x, dim=1, eps=1e-8)
+
+
 class ConvTripletNet(BaseTripletNet):
     def __init__(
         self,
@@ -428,7 +651,7 @@ class ConvTripletNet(BaseTripletNet):
         return F.normalize(x, dim=1, eps=1e-8)
 
 
-class TripletNet1(HybridTransformerTripletNet):
+class TripletNet1(DualBranchCLIPTripletNet):
     def __init__(
         self,
         d_model: int = DEFAULT_EMBEDDING_DIM,
@@ -440,10 +663,13 @@ class TripletNet1(HybridTransformerTripletNet):
             d_model=d_model,
             max_seq_len=max_seq_len if seq_len is None else seq_len,
             output_dim=output_dim,
-            model_dim=_choose_transformer_dim(d_model, preferred=512),
-            nhead=None,
+            model_dim=384,
+            nhead=8,
             num_layers=2,
             dropout=0.15,
+            dim_feedforward=1536,
+            projection_hidden_dim=512,
+            use_delta_branch=True,
         )
 
 
