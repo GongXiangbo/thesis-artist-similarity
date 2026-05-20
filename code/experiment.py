@@ -45,7 +45,7 @@ def parse_args():
     parser.add_argument("--triplets-csv", type=str, default="data/triplets/triplets_ids_spot.csv")
     parser.add_argument("--model", type=str, default="TripletNet1")
     parser.add_argument("--epochs", type=int, default=30)
-    parser.add_argument("--batch-size", type=int, default=512)
+    parser.add_argument("--batch-size", type=int, default=64)
     parser.add_argument(
         "--num-workers",
         type=int,
@@ -60,10 +60,11 @@ def parse_args():
         choices=["auto", "on", "off"],
         help="Cache memory-bank input tensors on the GPU when possible.",
     )
-    parser.add_argument("--amp", type=str, default="auto", choices=["auto", "on", "off"])
+    parser.add_argument("--amp", type=str, default="off", choices=["auto", "on", "off"])
     parser.add_argument("--amp-dtype", type=str, default="float16", choices=["float16", "bfloat16"])
     parser.add_argument("--matmul-precision", type=str, default="high", choices=["highest", "high", "medium"])
-    parser.add_argument("--deterministic", action="store_true")
+    parser.add_argument("--deterministic", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--allow-tf32", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--compile-model", action="store_true")
     parser.add_argument("--lr", type=float, default=2e-4)
     parser.add_argument("--weight-decay", type=float, default=1e-6)
@@ -117,7 +118,7 @@ def main():
     configure_torch_runtime(
         deterministic=args.deterministic,
         matmul_precision=args.matmul_precision,
-        allow_tf32=True,
+        allow_tf32=args.allow_tf32,
     )
     device = "cuda" if torch.cuda.is_available() else "cpu"
     amp_enabled = _resolve_amp_enabled(args.amp, device)

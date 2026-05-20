@@ -98,11 +98,13 @@ python code/experiment.py \
   --epochs 30
 ```
 
-The experiment entrypoint now defaults to GPU-throughput settings when CUDA is
-available: AMP, TF32/cuDNN benchmark, automatic DataLoader workers, larger
-memory-bank encoding batches, and automatic GPU caching for the memory-bank
-inputs when there is enough free VRAM. If VRAM is tight, lower `--batch-size` or
-set `--memory-bank-device-cache off`.
+The experiment entrypoint now keeps training quality first: the effective
+training batch defaults to `64`, AMP and TF32 are off by default, and
+deterministic kernels are enabled. GPU-safe throughput improvements remain in
+place where they do not change the training batch, including automatic
+DataLoader workers, larger no-gradient memory-bank encoding batches, and
+automatic GPU caching for memory-bank inputs when there is enough free VRAM.
+For a speed-oriented run, explicitly pass `--amp auto --allow-tf32 --no-deterministic`.
 
 ---
 

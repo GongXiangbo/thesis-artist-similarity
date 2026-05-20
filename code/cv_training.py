@@ -32,7 +32,7 @@ class FoldTrainingConfig:
     model_kwargs: dict[str, Any]
     output_dir: Path
     device: torch.device | str
-    batch_size: int = 512
+    batch_size: int = 64
     num_workers: int = -1
     num_epochs: int = 30
     learning_rate: float = 2e-4
@@ -44,7 +44,7 @@ class FoldTrainingConfig:
     grad_clip: float | None = 1.0
     memory_bank_batch_size: int | None = None
     memory_bank_device_cache: bool | None = None
-    amp_enabled: bool | None = None
+    amp_enabled: bool | None = False
     amp_dtype: torch.dtype | str = torch.float16
 
 
