@@ -7,12 +7,13 @@ training pipeline consumes precomputed per-frame CLIP embeddings, normally shape
 TripletNet1 structure:
     input CLIP frame embeddings
     -> frame-level L2 normalisation
-    -> shared 768 -> 384 projection adapter
-    -> Set/Style branch without positional encoding
+    -> shared 768 -> 512 projection adapter
+    -> Set/Style attentive-statistics branch
+    -> multi-scale temporal convolution branch
     -> 2-layer Temporal Transformer branch with positional encoding
-    -> optional temporal-delta branch
-    -> gated fusion
-    -> 512 -> 256 projection head
+    -> first/second-order temporal-delta branch
+    -> gated weighted-sum plus branch-concatenation fusion
+    -> 1024 -> 512 -> 256 projection head
     -> final L2-normalised video/artist embedding
 
 All models receive tensors shaped:
@@ -152,6 +153,48 @@ class AttentiveStatsPool(nn.Module):
         std = torch.sqrt(var.clamp_min(self.eps))
 
         return torch.cat([mean, std], dim=1)
+
+
+class MultiHeadAttentiveStatsPool(nn.Module):
+    """Multi-view attention-weighted mean + std pooling."""
+
+    def __init__(
+        self,
+        d_model: int,
+        num_heads: int = 4,
+        hidden_dim: int | None = None,
+        eps: float = 1e-6,
+    ) -> None:
+        super().__init__()
+
+        if d_model <= 0 or num_heads <= 0:
+            raise ValueError("d_model and num_heads must be positive")
+
+        hidden_dim = hidden_dim or min(256, max(64, d_model // 2))
+        self.num_heads = num_heads
+        self.eps = eps
+
+        self.attention = nn.Sequential(
+            nn.LayerNorm(d_model),
+            nn.Linear(d_model, hidden_dim),
+            nn.GELU(),
+            nn.Linear(hidden_dim, num_heads),
+        )
+
+        for module in self.modules():
+            if isinstance(module, nn.Linear):
+                _init_linear(module)
+
+    def forward(self, x: Tensor) -> Tensor:
+        if x.ndim != 3:
+            raise ValueError(f"Expected input shape (batch, seq_len, dim), got {tuple(x.shape)}")
+
+        weights = torch.softmax(self.attention(x), dim=1).transpose(1, 2)
+        mean = torch.bmm(weights, x)
+        var = torch.sum(weights.unsqueeze(-1) * (x.unsqueeze(1) - mean.unsqueeze(2)).pow(2), dim=2)
+        std = torch.sqrt(var.clamp_min(self.eps))
+
+        return torch.cat([mean, std], dim=2).flatten(1)
 
 
 class BaseTripletNet(nn.Module):
@@ -528,6 +571,294 @@ class DualBranchCLIPTripletNet(BaseTripletNet):
         return F.normalize(x, dim=1, eps=1e-8)
 
 
+class EnhancedCLIPRetrievalTripletNet(BaseTripletNet):
+    """Four-branch CLIP-frame aggregator tuned for artist retrieval."""
+
+    def __init__(
+        self,
+        d_model: int = DEFAULT_EMBEDDING_DIM,
+        output_dim: int = DEFAULT_OUTPUT_DIM,
+        max_seq_len: int = DEFAULT_MAX_SEQ_LEN,
+        model_dim: int = 512,
+        nhead: int | None = None,
+        num_layers: int = 2,
+        dropout: float = 0.15,
+        dim_feedforward: int | None = None,
+        projection_hidden_dim: int = 1024,
+        projection_mid_dim: int = 512,
+        conv_kernel_sizes: tuple[int, ...] = (3, 5, 7),
+        conv_channels: int | None = None,
+        attention_heads: int = 4,
+    ) -> None:
+        super().__init__()
+
+        if d_model <= 0 or output_dim <= 0 or max_seq_len <= 0 or model_dim <= 0:
+            raise ValueError("d_model, output_dim, max_seq_len and model_dim must be positive")
+        if num_layers <= 0:
+            raise ValueError("num_layers must be positive")
+        if projection_hidden_dim <= 0 or projection_mid_dim <= 0:
+            raise ValueError("projection hidden dimensions must be positive")
+        if not conv_kernel_sizes:
+            raise ValueError("conv_kernel_sizes must not be empty")
+        if any(kernel_size <= 0 for kernel_size in conv_kernel_sizes):
+            raise ValueError("conv_kernel_sizes must contain positive integers")
+        if attention_heads <= 0:
+            raise ValueError("attention_heads must be positive")
+
+        nhead = _select_nhead(model_dim, preferred=8) if nhead is None else nhead
+        if nhead <= 0 or model_dim % nhead != 0:
+            raise ValueError(f"nhead={nhead} must be positive and divide model_dim={model_dim}")
+
+        conv_channels = conv_channels or max(128, model_dim // 2)
+        if conv_channels <= 0:
+            raise ValueError("conv_channels must be positive")
+
+        self.d_model = d_model
+        self.model_dim = model_dim
+        self.output_dim = output_dim
+        self.max_seq_len = max_seq_len
+
+        self.frame_projection = nn.Sequential(
+            nn.LayerNorm(d_model),
+            nn.Linear(d_model, model_dim),
+            nn.GELU(),
+            nn.Dropout(dropout * 0.5),
+            nn.LayerNorm(model_dim),
+        )
+
+        set_pool_dim = model_dim * (2 * attention_heads + 2)
+        self.set_attentive_pool = MultiHeadAttentiveStatsPool(
+            d_model=model_dim,
+            num_heads=attention_heads,
+            hidden_dim=min(512, max(128, model_dim // 2)),
+        )
+        self.set_projection = nn.Sequential(
+            nn.LayerNorm(set_pool_dim),
+            nn.Linear(set_pool_dim, model_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.LayerNorm(model_dim),
+        )
+
+        self.conv_blocks = nn.ModuleList(
+            [
+                nn.Sequential(
+                    nn.Conv1d(model_dim, conv_channels, kernel_size=kernel_size, padding=kernel_size // 2),
+                    _make_group_norm(conv_channels),
+                    nn.GELU(),
+                    nn.Dropout(dropout),
+                    nn.Conv1d(conv_channels, conv_channels, kernel_size=kernel_size, padding=kernel_size // 2),
+                    _make_group_norm(conv_channels),
+                    nn.GELU(),
+                )
+                for kernel_size in conv_kernel_sizes
+            ]
+        )
+        conv_pool_dim = len(conv_kernel_sizes) * conv_channels * 2
+        self.conv_projection = nn.Sequential(
+            nn.LayerNorm(conv_pool_dim),
+            nn.Linear(conv_pool_dim, model_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.LayerNorm(model_dim),
+        )
+
+        self.cls_token = nn.Parameter(torch.empty(1, 1, model_dim))
+        self.pos_encoder = LearnedPositionalEncoding(
+            d_model=model_dim,
+            max_len=max_seq_len + 1,
+            dropout=dropout,
+        )
+        if dim_feedforward is None:
+            dim_feedforward = 4 * model_dim
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=model_dim,
+            nhead=nhead,
+            dim_feedforward=dim_feedforward,
+            dropout=dropout,
+            activation="gelu",
+            batch_first=True,
+            norm_first=True,
+        )
+        self.temporal_encoder = nn.TransformerEncoder(
+            encoder_layer=encoder_layer,
+            num_layers=num_layers,
+        )
+        self.temporal_attentive_pool = AttentiveStatsPool(
+            d_model=model_dim,
+            hidden_dim=min(256, max(64, model_dim // 2)),
+        )
+        self.temporal_projection = nn.Sequential(
+            nn.LayerNorm(model_dim * 5),
+            nn.Linear(model_dim * 5, model_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.LayerNorm(model_dim),
+        )
+
+        self.first_delta_attentive_pool = AttentiveStatsPool(
+            d_model=model_dim,
+            hidden_dim=min(256, max(64, model_dim // 2)),
+        )
+        self.second_delta_attentive_pool = AttentiveStatsPool(
+            d_model=model_dim,
+            hidden_dim=min(256, max(64, model_dim // 2)),
+        )
+        self.first_delta_projection = nn.Sequential(
+            nn.LayerNorm(model_dim * 4),
+            nn.Linear(model_dim * 4, model_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.LayerNorm(model_dim),
+        )
+        self.second_delta_projection = nn.Sequential(
+            nn.LayerNorm(model_dim * 4),
+            nn.Linear(model_dim * 4, model_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.LayerNorm(model_dim),
+        )
+        self.delta_projection = nn.Sequential(
+            nn.LayerNorm(model_dim * 2),
+            nn.Linear(model_dim * 2, model_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.LayerNorm(model_dim),
+        )
+
+        self.branch_count = 4
+        self.fusion_gate = nn.Sequential(
+            nn.LayerNorm(model_dim * self.branch_count),
+            nn.Linear(model_dim * self.branch_count, model_dim),
+            nn.GELU(),
+            nn.Dropout(dropout * 0.5),
+            nn.Linear(model_dim, self.branch_count),
+        )
+        self.projection_head = nn.Sequential(
+            nn.LayerNorm(model_dim * (self.branch_count + 1)),
+            nn.Linear(model_dim * (self.branch_count + 1), projection_hidden_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.LayerNorm(projection_hidden_dim),
+            nn.Linear(projection_hidden_dim, projection_mid_dim),
+            nn.GELU(),
+            nn.Dropout(dropout * 0.5),
+            nn.LayerNorm(projection_mid_dim),
+            nn.Linear(projection_mid_dim, output_dim),
+        )
+
+        self._init_weights()
+
+    def _init_weights(self) -> None:
+        nn.init.trunc_normal_(self.cls_token, std=0.02)
+        for module in self.modules():
+            if isinstance(module, nn.Linear):
+                _init_linear(module)
+            elif isinstance(module, nn.Conv1d):
+                nn.init.kaiming_normal_(module.weight, nonlinearity="linear")
+                if module.bias is not None:
+                    nn.init.zeros_(module.bias)
+
+    @staticmethod
+    def _pool_set_like(x: Tensor, attentive_pool: nn.Module) -> Tensor:
+        attentive_stats = attentive_pool(x)
+        mean_pool = x.mean(dim=1)
+        max_pool = x.amax(dim=1)
+        return torch.cat([attentive_stats, mean_pool, max_pool], dim=1)
+
+    def _validate_input(self, x: Tensor) -> None:
+        if x.ndim != 3:
+            raise ValueError(f"Expected input shape (batch, seq_len, dim), got {tuple(x.shape)}")
+        if x.size(1) <= 0:
+            raise ValueError("Input sequence length must be positive")
+        if x.size(1) > self.max_seq_len:
+            raise ValueError(f"Input sequence length {x.size(1)} exceeds max_seq_len {self.max_seq_len}")
+        if x.size(2) != self.d_model:
+            raise ValueError(f"Input feature dim {x.size(2)} does not match d_model {self.d_model}")
+
+    def _encode_set_branch(self, x: Tensor) -> Tensor:
+        pooled = self._pool_set_like(x, self.set_attentive_pool)
+        return self.set_projection(pooled)
+
+    def _encode_conv_branch(self, x: Tensor) -> Tensor:
+        tokens = x.transpose(1, 2)
+        pooled_features: list[Tensor] = []
+        for block in self.conv_blocks:
+            features = block(tokens)
+            pooled_features.append(F.adaptive_avg_pool1d(features, output_size=1).squeeze(-1))
+            pooled_features.append(F.adaptive_max_pool1d(features, output_size=1).squeeze(-1))
+        return self.conv_projection(torch.cat(pooled_features, dim=1))
+
+    def _encode_temporal_branch(self, x: Tensor) -> Tensor:
+        cls = self.cls_token.expand(x.size(0), -1, -1)
+        tokens = torch.cat([cls, x], dim=1)
+        tokens = self.pos_encoder(tokens)
+        tokens = self.temporal_encoder(tokens)
+
+        cls_out = tokens[:, 0]
+        frame_tokens = tokens[:, 1:]
+        attentive_stats = self.temporal_attentive_pool(frame_tokens)
+        mean_pool = frame_tokens.mean(dim=1)
+        max_pool = frame_tokens.amax(dim=1)
+        pooled = torch.cat([cls_out, attentive_stats, mean_pool, max_pool], dim=1)
+        return self.temporal_projection(pooled)
+
+    def _encode_delta_order(
+        self,
+        deltas: Tensor,
+        attentive_pool: AttentiveStatsPool,
+        projection: nn.Module,
+    ) -> Tensor:
+        if deltas.size(1) <= 0:
+            return deltas.new_zeros(deltas.size(0), self.model_dim)
+        pooled = self._pool_set_like(deltas, attentive_pool)
+        return projection(pooled)
+
+    def _encode_delta_branch(self, x: Tensor) -> Tensor:
+        if x.size(1) < 2:
+            first_delta_embedding = x.new_zeros(x.size(0), self.model_dim)
+            second_delta_embedding = x.new_zeros(x.size(0), self.model_dim)
+        else:
+            first_deltas = x[:, 1:, :] - x[:, :-1, :]
+            first_delta_embedding = self._encode_delta_order(
+                first_deltas,
+                self.first_delta_attentive_pool,
+                self.first_delta_projection,
+            )
+            if first_deltas.size(1) < 2:
+                second_delta_embedding = x.new_zeros(x.size(0), self.model_dim)
+            else:
+                second_deltas = first_deltas[:, 1:, :] - first_deltas[:, :-1, :]
+                second_delta_embedding = self._encode_delta_order(
+                    second_deltas,
+                    self.second_delta_attentive_pool,
+                    self.second_delta_projection,
+                )
+
+        return self.delta_projection(torch.cat([first_delta_embedding, second_delta_embedding], dim=1))
+
+    def encode(self, x: Tensor) -> Tensor:
+        self._validate_input(x)
+
+        x = F.normalize(x.float(), dim=2, eps=1e-8)
+        x = self.frame_projection(x)
+
+        branch_embeddings = [
+            self._encode_set_branch(x),
+            self._encode_conv_branch(x),
+            self._encode_temporal_branch(x),
+            self._encode_delta_branch(x),
+        ]
+        gate_input = torch.cat(branch_embeddings, dim=1)
+        branch_stack = torch.stack(branch_embeddings, dim=1)
+        weights = torch.softmax(self.fusion_gate(gate_input), dim=1).unsqueeze(-1)
+        weighted_sum = torch.sum(weights * branch_stack, dim=1)
+
+        fused = torch.cat([weighted_sum, gate_input], dim=1)
+        x = self.projection_head(fused)
+        return F.normalize(x, dim=1, eps=1e-8)
+
+
 class ConvTripletNet(BaseTripletNet):
     def __init__(
         self,
@@ -651,7 +982,7 @@ class ConvTripletNet(BaseTripletNet):
         return F.normalize(x, dim=1, eps=1e-8)
 
 
-class TripletNet1(DualBranchCLIPTripletNet):
+class TripletNet1(EnhancedCLIPRetrievalTripletNet):
     def __init__(
         self,
         d_model: int = DEFAULT_EMBEDDING_DIM,
@@ -663,13 +994,15 @@ class TripletNet1(DualBranchCLIPTripletNet):
             d_model=d_model,
             max_seq_len=max_seq_len if seq_len is None else seq_len,
             output_dim=output_dim,
-            model_dim=384,
+            model_dim=512,
             nhead=8,
             num_layers=2,
             dropout=0.15,
-            dim_feedforward=1536,
-            projection_hidden_dim=512,
-            use_delta_branch=True,
+            dim_feedforward=2048,
+            projection_hidden_dim=1024,
+            projection_mid_dim=512,
+            conv_kernel_sizes=(3, 5, 7),
+            attention_heads=4,
         )
 
 

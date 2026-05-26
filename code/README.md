@@ -14,7 +14,7 @@ This version keeps your original research direction and model definitions, but r
    - Replaced repeated forward logic with reusable base classes.
    - Added a model registry and `build_model(...)`.
    - Removed hard-coded fully connected input sizes by inferring them automatically.
-   - Replaced `TripletNet1` with a dual-branch CLIP-frame aggregator: frame-level L2 normalisation, 768→384 projection, Set/Style attention branch, 2-layer Temporal Transformer branch, optional temporal-delta branch, gated fusion, and 512→256 projection head.
+   - Replaced `TripletNet1` with a four-branch CLIP-frame retrieval aggregator: frame-level L2 normalisation, 768→512 projection, Set/Style attention branch, multi-scale temporal convolution branch, 2-layer Temporal Transformer branch, first/second-order temporal-delta branch, gated weighted-sum plus concatenation fusion, and 1024→512→256 projection head.
 
 3. **Refactored `dataset.py`**
    - Removed CLIP loading at import time.
@@ -71,7 +71,7 @@ The previous anchor-only protocol is not recommended for final reporting because
 
 ## Important note about existing notebook results
 
-`TripletNet1` has been replaced with the new dual-branch CLIP-frame architecture.
+`TripletNet1` has been replaced with the new four-branch CLIP-frame retrieval architecture.
 The old saved outputs in `model1.ipynb` correspond to the previous TripletNet1 implementation and should be treated only as historical experiment records.
 After this change, rerun the margin grid and compare models again before reporting final thesis results.
 
