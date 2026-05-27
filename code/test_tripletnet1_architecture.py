@@ -19,6 +19,12 @@ def test_tripletnet1_output_shape_and_normalization() -> None:
     assert torch.allclose(out.norm(dim=1), torch.ones(2), atol=1e-5)
 
 
+def test_tripletnet1_transformer_uses_post_norm_to_avoid_nested_tensor_warning() -> None:
+    model = TripletNet1(d_model=768, seq_len=30, output_dim=256).eval()
+
+    assert not model.temporal_encoder.layers[0].norm_first
+
+
 def test_tripletnet1_handles_single_frame_delta_case() -> None:
     model = TripletNet1(d_model=768, seq_len=1, output_dim=256).eval()
     x = torch.randn(2, 1, 768)

@@ -14,7 +14,7 @@ This version keeps your original research direction and model definitions, but r
    - Replaced repeated forward logic with reusable base classes.
    - Added a model registry and `build_model(...)`.
    - Removed hard-coded fully connected input sizes by inferring them automatically.
-   - Replaced `TripletNet1` with a four-branch CLIP-frame retrieval aggregator: frame-level L2 normalisation, 768→512 projection, Set/Style attention branch, multi-scale temporal convolution branch, 2-layer Temporal Transformer branch, first/second-order temporal-delta branch, gated weighted-sum plus concatenation fusion, and 1024→512→256 projection head.
+   - Replaced `TripletNet1` with a four-branch CLIP-frame retrieval aggregator: frame-level L2 normalisation, 768→512 projection, Set/Style attention branch, multi-scale temporal convolution branch, 2-layer Temporal Transformer branch, first/second-order temporal-delta branch, CLIP mean residual anchoring, gated weighted-sum plus concatenation fusion, and 1024→512→256 projection head.
 
 3. **Refactored `dataset.py`**
    - Removed CLIP loading at import time.

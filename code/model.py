@@ -12,6 +12,7 @@ TripletNet1 structure:
     -> multi-scale temporal convolution branch
     -> 2-layer Temporal Transformer branch with positional encoding
     -> first/second-order temporal-delta branch
+    -> CLIP mean residual anchor
     -> gated weighted-sum plus branch-concatenation fusion
     -> 1024 -> 512 -> 256 projection head
     -> final L2-normalised video/artist embedding
@@ -572,7 +573,12 @@ class DualBranchCLIPTripletNet(BaseTripletNet):
 
 
 class EnhancedCLIPRetrievalTripletNet(BaseTripletNet):
-    """Four-branch CLIP-frame aggregator tuned for artist retrieval."""
+    """Four-branch CLIP-frame aggregator tuned for artist retrieval.
+
+    A deterministic CLIP-mean residual is blended into the learned representation
+    so early epochs keep a stable retrieval prior instead of relying entirely on
+    a randomly initialised deep projection head.
+    """
 
     def __init__(
         self,
@@ -617,6 +623,7 @@ class EnhancedCLIPRetrievalTripletNet(BaseTripletNet):
         self.model_dim = model_dim
         self.output_dim = output_dim
         self.max_seq_len = max_seq_len
+        self.learned_output_logit = nn.Parameter(torch.tensor(-1.0))
 
         self.frame_projection = nn.Sequential(
             nn.LayerNorm(d_model),
@@ -678,7 +685,7 @@ class EnhancedCLIPRetrievalTripletNet(BaseTripletNet):
             dropout=dropout,
             activation="gelu",
             batch_first=True,
-            norm_first=True,
+            norm_first=False,
         )
         self.temporal_encoder = nn.TransformerEncoder(
             encoder_layer=encoder_layer,
@@ -776,6 +783,16 @@ class EnhancedCLIPRetrievalTripletNet(BaseTripletNet):
         if x.size(2) != self.d_model:
             raise ValueError(f"Input feature dim {x.size(2)} does not match d_model {self.d_model}")
 
+    def _raw_clip_residual(self, x: Tensor) -> Tensor:
+        raw_mean = x.mean(dim=1)
+        if self.output_dim == self.d_model:
+            residual = raw_mean
+        elif self.output_dim < self.d_model:
+            residual = F.adaptive_avg_pool1d(raw_mean.unsqueeze(1), self.output_dim).squeeze(1)
+        else:
+            residual = F.pad(raw_mean, (0, self.output_dim - self.d_model))
+        return F.normalize(residual, dim=1, eps=1e-8)
+
     def _encode_set_branch(self, x: Tensor) -> Tensor:
         pooled = self._pool_set_like(x, self.set_attentive_pool)
         return self.set_projection(pooled)
@@ -841,6 +858,7 @@ class EnhancedCLIPRetrievalTripletNet(BaseTripletNet):
         self._validate_input(x)
 
         x = F.normalize(x.float(), dim=2, eps=1e-8)
+        clip_residual = self._raw_clip_residual(x)
         x = self.frame_projection(x)
 
         branch_embeddings = [
@@ -849,13 +867,16 @@ class EnhancedCLIPRetrievalTripletNet(BaseTripletNet):
             self._encode_temporal_branch(x),
             self._encode_delta_branch(x),
         ]
+        branch_embeddings = [F.normalize(branch, dim=1, eps=1e-8) for branch in branch_embeddings]
         gate_input = torch.cat(branch_embeddings, dim=1)
         branch_stack = torch.stack(branch_embeddings, dim=1)
         weights = torch.softmax(self.fusion_gate(gate_input), dim=1).unsqueeze(-1)
         weighted_sum = torch.sum(weights * branch_stack, dim=1)
 
         fused = torch.cat([weighted_sum, gate_input], dim=1)
-        x = self.projection_head(fused)
+        learned_output = F.normalize(self.projection_head(fused), dim=1, eps=1e-8)
+        learned_weight = torch.sigmoid(self.learned_output_logit)
+        x = (1.0 - learned_weight) * clip_residual + learned_weight * learned_output
         return F.normalize(x, dim=1, eps=1e-8)
 
 
