@@ -20,6 +20,7 @@ from dataset import (
     create_triplets,
     create_triplets_with_ids,
     filter_triplets,
+    infer_artist_tensor_shape,
     infer_embedding_shape,
     process_artists,
     split_triplet_dataframe_by_artist,
@@ -62,6 +63,31 @@ def parse_args():
     parser.add_argument("--train-ratio", type=float, default=0.8)
     parser.add_argument("--seed", type=int, default=3407)
     parser.add_argument("--output-dir", type=str, default="results/checkpoints")
+    parser.add_argument(
+        "--artist-aggregation",
+        type=str,
+        default="stack",
+        choices=["mean", "stack"],
+        help="Use 'stack' for hierarchical TripletNet1: (videos, frames, dim) with zero padding.",
+    )
+    parser.add_argument(
+        "--videos-per-artist",
+        type=int,
+        default=10,
+        help="Maximum number of videos retained per artist in stack mode.",
+    )
+    parser.add_argument(
+        "--num-frames",
+        type=int,
+        default=30,
+        help="Frame embeddings per video in stack mode; use the default 30 for current data.",
+    )
+    parser.add_argument(
+        "--video-dropout",
+        type=float,
+        default=0.15,
+        help="Training-time probability of dropping each valid video inside TripletNet1.",
+    )
     return parser.parse_args()
 
 
@@ -74,10 +100,22 @@ def main():
     output_dir = resolve_project_path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    artist_averages = process_artists(base_dir)
+    artist_averages = process_artists(
+        base_dir,
+        aggregation=args.artist_aggregation,
+        max_videos=args.videos_per_artist,
+        num_frames=args.num_frames,
+    )
     if not artist_averages:
         raise RuntimeError(f"No artist embeddings found under {base_dir}")
     seq_len, d_model = infer_embedding_shape(artist_averages)
+    artist_tensor_shape = infer_artist_tensor_shape(artist_averages)
+    inferred_videos = int(artist_tensor_shape[0]) if len(artist_tensor_shape) == 3 else 1
+    if len(artist_tensor_shape) == 3 and args.model != "TripletNet1":
+        raise RuntimeError(
+            "aggregation='stack' produces 4D batches and is currently supported only by TripletNet1. "
+            "Use --artist-aggregation mean for TripletNet2-5."
+        )
 
     df = pd.read_csv(triplets_csv)
     filtered_df = filter_triplets(df, artist_averages)
@@ -90,7 +128,10 @@ def main():
         seed=args.seed,
     )
     print(f"Split stats: {split_stats}")
-    print(f"Inferred embedding shape: seq_len={seq_len}, d_model={d_model}")
+    print(
+        f"Inferred artist tensor shape: {artist_tensor_shape} | "
+        f"frames={seq_len}, d_model={d_model}, videos={inferred_videos}"
+    )
 
     uses_dynamic_mining = args.negative_mining in {"batch_semihard", "memory_bank_semihard"}
     if uses_dynamic_mining:
@@ -113,7 +154,10 @@ def main():
         num_workers=args.num_workers,
     )
 
-    model = build_model(args.model, d_model=d_model, seq_len=seq_len).to(device)
+    model_kwargs = {"d_model": d_model, "seq_len": seq_len}
+    if args.model == "TripletNet1":
+        model_kwargs.update({"max_videos": inferred_videos, "video_dropout_p": args.video_dropout})
+    model = build_model(args.model, **model_kwargs).to(device)
     if args.distance_fn == "cosine":
         criterion = nn.TripletMarginWithDistanceLoss(distance_function=cosine_distance, margin=args.margin, swap=True)
     else:

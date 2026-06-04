@@ -235,28 +235,122 @@ def filter_artists_by_common_shape(artists: dict[str, Tensor]) -> dict[str, Tens
     return {artist_id: tensor for artist_id, tensor in artists.items() if tuple(tensor.shape) == target_shape}
 
 
+def stack_tensors(
+    tensors: Sequence[Tensor],
+    *,
+    max_videos: int = 10,
+    num_frames: int | None = 30,
+    pad_value: float = 0.0,
+) -> Tensor | None:
+    """Stack up to ``max_videos`` video tensors and zero-pad missing videos.
+
+    Each stored video embedding is expected to be a frame-level CLIP tensor with
+    shape ``(frames, embedding_dim)``. The returned artist tensor has shape
+    ``(max_videos, num_frames, embedding_dim)`` and can be consumed directly by
+    the hierarchical TripletNet1. Missing videos are padded with all-zero tensors;
+    the model derives the valid-video mask from these zero rows instead of using
+    cyclic repetition.
+    """
+    if max_videos <= 0:
+        raise ValueError("max_videos must be positive")
+
+    target_shape = _most_common_shape(tensors)
+    if target_shape is None:
+        return None
+    if len(target_shape) != 2:
+        raise ValueError(f"Expected 2D per-video tensors, got common shape {tuple(target_shape)}")
+
+    target_frames = int(target_shape[0]) if num_frames is None else int(num_frames)
+    embedding_dim = int(target_shape[1])
+    if target_frames <= 0:
+        raise ValueError("num_frames must be positive")
+
+    valid_tensors: list[Tensor] = []
+    for tensor in tensors:
+        tensor = tensor.float().cpu()
+        if tensor.ndim != 2 or int(tensor.shape[1]) != embedding_dim:
+            continue
+        if int(tensor.shape[0]) < target_frames:
+            pad_frames = target_frames - int(tensor.shape[0])
+            tensor = torch.nn.functional.pad(tensor, (0, 0, 0, pad_frames), value=pad_value)
+        elif int(tensor.shape[0]) > target_frames:
+            tensor = tensor[:target_frames]
+        valid_tensors.append(tensor)
+
+    if not valid_tensors:
+        return None
+
+    valid_tensors = valid_tensors[:max_videos]
+    if len(valid_tensors) < max_videos:
+        pad_video = torch.full((target_frames, embedding_dim), float(pad_value), dtype=torch.float32)
+        valid_tensors.extend(pad_video.clone() for _ in range(max_videos - len(valid_tensors)))
+
+    return torch.stack(valid_tensors, dim=0)
+
+
 def infer_embedding_shape(artist_averages: dict[str, Tensor]) -> tuple[int, int]:
+    """Infer ``(frames_per_video, embedding_dim)`` from artist tensors.
+
+    Backward-compatible 2D tensors are interpreted as ``(frames, dim)``.
+    Hierarchical 3D artist tensors are interpreted as
+    ``(videos, frames, dim)`` and return the inner frame shape.
+    """
     if not artist_averages:
         raise ValueError("artist_averages is empty")
     first = next(iter(artist_averages.values()))
-    if first.ndim != 2:
-        raise ValueError(f"Expected artist embeddings to be 2D, got shape {tuple(first.shape)}")
-    return int(first.shape[0]), int(first.shape[1])
+    if first.ndim == 2:
+        return int(first.shape[0]), int(first.shape[1])
+    if first.ndim == 3:
+        return int(first.shape[1]), int(first.shape[2])
+    raise ValueError(f"Expected artist embeddings to be 2D or 3D, got shape {tuple(first.shape)}")
+
+
+def infer_artist_tensor_shape(artist_averages: dict[str, Tensor]) -> tuple[int, ...]:
+    if not artist_averages:
+        raise ValueError("artist_averages is empty")
+    return tuple(int(dim) for dim in next(iter(artist_averages.values())).shape)
 
 
 def process_artists(
     base_dir: str | os.PathLike,
     *,
+    aggregation: str = "mean",
+    max_videos: int = 10,
+    num_frames: int | None = 30,
     keep_most_common_shape: bool = True,
 ) -> dict[str, Tensor]:
+    """Load artist video embeddings.
+
+    Parameters
+    ----------
+    aggregation:
+        ``"mean"`` preserves the old behaviour by averaging all valid videos into
+        one ``(frames, dim)`` tensor. ``"stack"`` keeps the artist structure as
+        ``(max_videos, frames, dim)`` with zero padding and is the recommended
+        mode for the hierarchical TripletNet1.
+    max_videos:
+        Maximum number of videos retained per artist when ``aggregation="stack"``.
+    num_frames:
+        Number of frames per video in stack mode. Use ``None`` to keep the most
+        common frame length found in that artist folder.
+    """
+    aggregation = aggregation.lower().strip()
+    if aggregation not in {"mean", "stack"}:
+        raise ValueError("aggregation must be either 'mean' or 'stack'")
+
     artists: dict[str, Tensor] = {}
     base_dir = Path(base_dir)
     for artist_id in sorted(os.listdir(base_dir)):
         artist_dir = base_dir / artist_id / "embeddings"
-        if artist_dir.is_dir():
-            avg_tensor = average_tensors(load_pt_files(artist_dir))
-            if avg_tensor is not None:
-                artists[str(artist_id)] = avg_tensor
+        if not artist_dir.is_dir():
+            continue
+        tensors = load_pt_files(artist_dir)
+        if aggregation == "mean":
+            artist_tensor = average_tensors(tensors)
+        else:
+            artist_tensor = stack_tensors(tensors, max_videos=max_videos, num_frames=num_frames)
+        if artist_tensor is not None:
+            artists[str(artist_id)] = artist_tensor
     return filter_artists_by_common_shape(artists) if keep_most_common_shape else artists
 
 
