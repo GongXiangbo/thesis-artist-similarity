@@ -1,20 +1,16 @@
-# TripletNet1 A+B+C+D + Video Dropout Modification Notes
+# TripletNet1 Simple Transformer + Video Dropout Modification Notes
 
 Implemented changes:
 
 1. `TripletNet1` now supports hierarchical artist tensors shaped `(videos, frames, embedding_dim)`.
 2. `dataset.process_artists(..., aggregation="stack")` keeps up to 10 videos per artist and zero-pads missing videos.
 3. `TripletNet1` infers valid videos from all-zero padded video tensors.
-4. Frame-to-video encoder uses:
-   - set/style attentive-statistics branch;
-   - temporal Transformer branch;
-   - first/second-order delta branch.
-5. Artist-level encoder uses:
-   - masked video-set attentive-statistics branch;
-   - masked self-attention branch over video tokens without video position embeddings.
-6. Final embedding uses BNNeck, L2 normalization, and a sample-dependent learnable residual gate to a projected raw CLIP mean.
-7. Training-time video dropout is enabled through `--video-dropout`, default `0.15`.
-8. `experiment.py` defaults to `--artist-aggregation stack`, `--videos-per-artist 10`, and `--num-frames 30`.
+4. Frame embeddings are projected to `model_dim` with Linear/LayerNorm.
+5. Frame-to-video encoding uses a frame-level `TransformerEncoder` and mean pooling.
+6. Artist-level encoding uses a masked `TransformerEncoder` over valid video tokens, followed by masked mean pooling.
+7. Final embedding uses a projection head, BNNeck, and L2 normalization.
+8. Training-time video dropout is enabled through `--video-dropout`, default `0.15`.
+9. `experiment.py` defaults to `--artist-aggregation stack`, `--videos-per-artist 10`, and `--num-frames 30`.
 
 Verification run:
 

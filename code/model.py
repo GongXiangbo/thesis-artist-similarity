@@ -5,12 +5,12 @@ TripletNet1 is a hierarchical video-to-artist encoder for the current data setup
       -> up to 10 videos, zero-padded when fewer videos are available
       -> each video has 30 uniformly sampled CLIP frame embeddings
 
-TripletNet1 implements only the requested A+B+C+D + video-dropout changes:
-    A. stack videos per artist with zero padding and an inferred valid-video mask;
-    B. frame-to-video set/style, temporal and delta branches;
-    C. artist-level masked set/context encoder over video tokens;
-    D. learnable raw-CLIP residual gate plus BNNeck for cosine triplet learning;
-    + training-time video dropout.
+TripletNet1 uses a simple hierarchical Encoder-only Transformer:
+    1. project CLIP frame embeddings to model_dim;
+    2. encode frames inside each video with a TransformerEncoder;
+    3. pool encoded frames into one video token;
+    4. encode up to 10 video tokens with a masked TransformerEncoder;
+    5. masked-pool video tokens, then projection head + BNNeck + L2 normalize.
 
 TripletNet1 accepts tensors shaped either:
     (batch, videos, frames, d_model), recommended, or
@@ -772,7 +772,7 @@ class ConvTripletNet(BaseTripletNet):
         return F.normalize(x, dim=1, eps=1e-8)
 
 
-class TripletNet1(HierarchicalVideoArtistTripletNet):
+class TripletNet1(BaseTripletNet):
     def __init__(
         self,
         d_model: int = DEFAULT_EMBEDDING_DIM,
@@ -786,30 +786,190 @@ class TripletNet1(HierarchicalVideoArtistTripletNet):
         dim_feedforward: int | None = None,
         projection_hidden_dim: int | None = None,
         projection_mid_dim: int | None = None,
+        frame_transformer_layers: int = 1,
+        artist_transformer_layers: int = 1,
+        dropout: float = 0.15,
+        mask_eps: float = 1e-12,
     ) -> None:
+        super().__init__()
+        max_seq_len = max_seq_len if seq_len is None else seq_len
+        if d_model <= 0 or output_dim <= 0 or max_seq_len <= 0 or max_videos <= 0 or model_dim <= 0:
+            raise ValueError("d_model, output_dim, max_seq_len, max_videos and model_dim must be positive")
+        if frame_transformer_layers <= 0 or artist_transformer_layers <= 0:
+            raise ValueError("transformer layer counts must be positive")
+        if not 0.0 <= video_dropout_p < 1.0:
+            raise ValueError("video_dropout_p must be in [0, 1)")
+        if not 0.0 <= dropout < 1.0:
+            raise ValueError("dropout must be in [0, 1)")
+        if mask_eps < 0:
+            raise ValueError("mask_eps must be non-negative")
+
+        nhead = _select_nhead(model_dim, preferred=8) if nhead is None else nhead
+        if nhead <= 0 or model_dim % nhead != 0:
+            raise ValueError(f"nhead={nhead} must be positive and divide model_dim={model_dim}")
         if dim_feedforward is None:
             dim_feedforward = 4 * model_dim
         if projection_hidden_dim is None:
             projection_hidden_dim = max(2 * model_dim, 2 * output_dim)
         if projection_mid_dim is None:
             projection_mid_dim = max(model_dim, output_dim)
-        super().__init__(
-            d_model=d_model,
-            max_seq_len=max_seq_len if seq_len is None else seq_len,
-            max_videos=max_videos,
-            output_dim=output_dim,
-            model_dim=model_dim,
-            nhead=nhead,
-            frame_transformer_layers=1,
-            artist_transformer_layers=1,
-            dropout=0.15,
-            dim_feedforward=dim_feedforward,
-            projection_hidden_dim=projection_hidden_dim,
-            projection_mid_dim=projection_mid_dim,
-            frame_attention_heads=4,
-            artist_attention_heads=4,
-            video_dropout_p=video_dropout_p,
+        if projection_hidden_dim <= 0 or projection_mid_dim <= 0:
+            raise ValueError("projection hidden dimensions must be positive")
+
+        self.d_model = d_model
+        self.model_dim = model_dim
+        self.output_dim = output_dim
+        self.max_seq_len = max_seq_len
+        self.max_videos = max_videos
+        self.video_dropout_p = float(video_dropout_p)
+        self.mask_eps = float(mask_eps)
+
+        self.frame_projection = nn.Sequential(
+            nn.LayerNorm(d_model),
+            nn.Linear(d_model, model_dim),
+            nn.LayerNorm(model_dim),
+            nn.Dropout(dropout),
         )
+        self.frame_pos_encoder = LearnedPositionalEncoding(
+            d_model=model_dim,
+            max_len=max_seq_len,
+            dropout=dropout,
+        )
+        frame_encoder_layer = nn.TransformerEncoderLayer(
+            d_model=model_dim,
+            nhead=nhead,
+            dim_feedforward=dim_feedforward,
+            dropout=dropout,
+            activation="gelu",
+            batch_first=True,
+            norm_first=True,
+        )
+        self.frame_encoder = _make_transformer_encoder(
+            encoder_layer=frame_encoder_layer,
+            num_layers=frame_transformer_layers,
+        )
+        self.video_token_norm = nn.LayerNorm(model_dim)
+
+        artist_encoder_layer = nn.TransformerEncoderLayer(
+            d_model=model_dim,
+            nhead=nhead,
+            dim_feedforward=dim_feedforward,
+            dropout=dropout,
+            activation="gelu",
+            batch_first=True,
+            norm_first=True,
+        )
+        self.artist_encoder = _make_transformer_encoder(
+            encoder_layer=artist_encoder_layer,
+            num_layers=artist_transformer_layers,
+        )
+        self.artist_pool_norm = nn.LayerNorm(model_dim)
+
+        self.projection_head = nn.Sequential(
+            nn.LayerNorm(model_dim),
+            nn.Linear(model_dim, projection_hidden_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.LayerNorm(projection_hidden_dim),
+            nn.Linear(projection_hidden_dim, projection_mid_dim),
+            nn.GELU(),
+            nn.Dropout(dropout * 0.5),
+            nn.LayerNorm(projection_mid_dim),
+            nn.Linear(projection_mid_dim, output_dim),
+        )
+        self.bnneck = SafeBatchNorm1d(output_dim)
+        if self.bnneck.bias is not None:
+            self.bnneck.bias.requires_grad_(False)
+
+        self.last_video_mask: Tensor | None = None
+        self.last_residual_alpha: Tensor | None = None
+        self._init_weights()
+
+    def _init_weights(self) -> None:
+        for module in self.modules():
+            if isinstance(module, nn.Linear):
+                _init_linear(module)
+
+    @staticmethod
+    def _ensure_one_valid_video(mask: Tensor) -> Tensor:
+        if mask.ndim != 2:
+            raise ValueError(f"Expected video mask shape (batch, videos), got {tuple(mask.shape)}")
+        mask = mask.bool()
+        if mask.any(dim=1).all():
+            return mask
+        mask = mask.clone()
+        mask[~mask.any(dim=1), 0] = True
+        return mask
+
+    @staticmethod
+    def _masked_mean(x: Tensor, mask: Tensor) -> Tensor:
+        weights = mask.to(dtype=x.dtype).unsqueeze(-1)
+        return (x * weights).sum(dim=1) / weights.sum(dim=1).clamp_min(1.0)
+
+    def _prepare_artist_input(self, x: Tensor) -> tuple[Tensor, Tensor]:
+        was_three_dim = x.ndim == 3
+        if was_three_dim:
+            x = x.unsqueeze(1)
+        elif x.ndim != 4:
+            raise ValueError(
+                "Expected input shape (batch, frames, dim) or (batch, videos, frames, dim), "
+                f"got {tuple(x.shape)}"
+            )
+
+        if x.size(1) <= 0 or x.size(2) <= 0:
+            raise ValueError("Input must contain at least one video and one frame")
+        if x.size(1) > self.max_videos:
+            raise ValueError(f"Input video count {x.size(1)} exceeds max_videos {self.max_videos}")
+        if x.size(2) > self.max_seq_len:
+            raise ValueError(f"Input frame length {x.size(2)} exceeds max_seq_len {self.max_seq_len}")
+        if x.size(3) != self.d_model:
+            raise ValueError(f"Input feature dim {x.size(3)} does not match d_model {self.d_model}")
+
+        x = x.float()
+        if was_three_dim:
+            video_mask = torch.ones(x.size(0), 1, dtype=torch.bool, device=x.device)
+        else:
+            video_mask = x.detach().abs().sum(dim=(2, 3)) > self.mask_eps
+        return x, self._ensure_one_valid_video(video_mask)
+
+    def _apply_video_dropout(self, video_mask: Tensor) -> Tensor:
+        video_mask = self._ensure_one_valid_video(video_mask)
+        if not self.training or self.video_dropout_p <= 0:
+            return video_mask
+        keep = torch.rand(video_mask.shape, device=video_mask.device) > self.video_dropout_p
+        dropped_mask = video_mask & keep
+        empty_rows = ~dropped_mask.any(dim=1)
+        if empty_rows.any():
+            first_valid = video_mask.float().argmax(dim=1)
+            dropped_mask[empty_rows, first_valid[empty_rows]] = True
+        return dropped_mask
+
+    def _encode_video_tokens(self, x: Tensor) -> Tensor:
+        batch_size, video_count, frame_count, _ = x.shape
+        frame_tokens = x.reshape(batch_size * video_count, frame_count, self.d_model)
+        frame_tokens = self.frame_projection(frame_tokens)
+        frame_tokens = self.frame_pos_encoder(frame_tokens)
+        frame_tokens = self.frame_encoder(frame_tokens)
+        video_tokens = frame_tokens.mean(dim=1)
+        return self.video_token_norm(video_tokens).view(batch_size, video_count, self.model_dim)
+
+    def encode(self, x: Tensor) -> Tensor:
+        x, video_mask = self._prepare_artist_input(x)
+        video_mask = self._apply_video_dropout(video_mask)
+        self.last_video_mask = video_mask.detach()
+        self.last_residual_alpha = None
+
+        video_tokens = self._encode_video_tokens(x)
+        video_tokens = video_tokens * video_mask.to(dtype=video_tokens.dtype).unsqueeze(-1)
+
+        artist_tokens = self.artist_encoder(video_tokens, src_key_padding_mask=~video_mask)
+        artist_tokens = artist_tokens * video_mask.to(dtype=artist_tokens.dtype).unsqueeze(-1)
+        artist_embedding = self._masked_mean(artist_tokens, video_mask)
+        artist_embedding = self.artist_pool_norm(artist_embedding)
+
+        out = self.projection_head(artist_embedding)
+        out = self.bnneck(out)
+        return F.normalize(out, dim=1, eps=1e-8)
 
 
 class TripletNet2(ConvTripletNet):

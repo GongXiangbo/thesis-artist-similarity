@@ -8,14 +8,12 @@ This package keeps the original triplet-learning pipeline, but changes `TripletN
    - Input: `(batch, videos<=10, frames=30, dim=768)`.
    - Backward compatible input: `(batch, frames, dim)` is treated as one valid video.
    - Video padding is inferred from all-zero video tensors.
-   - Frame-level encoder has three branches only:
-     - set/style attentive-statistics branch;
-     - temporal Transformer branch with frame positional encoding;
-     - first/second-order CLIP-delta branch.
-   - Artist-level encoder has two masked branches:
-     - masked video-set attentive-statistics branch;
-     - masked self-attention branch over video tokens, without video positional encoding.
-   - Final output uses BNNeck + L2 normalization and a learnable residual gate against the raw CLIP mean.
+   - CLIP frame embeddings are projected with Linear/LayerNorm to `model_dim`.
+   - A frame-level `TransformerEncoder` encodes each video's 30 frame embeddings.
+   - Encoded frames are mean-pooled into one video token per video.
+   - An artist-level masked `TransformerEncoder` encodes up to 10 video tokens.
+   - Valid video tokens are masked-mean-pooled.
+   - Final output uses projection head + BNNeck + L2 normalization.
 
 2. **`dataset.py` supports stacked artist tensors**
    - `process_artists(..., aggregation="stack", max_videos=10, num_frames=30)` returns `(10, 30, 768)` per artist.

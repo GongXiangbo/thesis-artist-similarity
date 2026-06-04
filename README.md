@@ -31,13 +31,12 @@ By default it reads embeddings from `data/video_embeddings`, triplets from `data
 
 ## What changed in TripletNet1
 
-- frame-to-video set/style branch;
-- frame-to-video temporal Transformer branch;
-- frame-to-video CLIP-delta branch;
-- dimension-wise branch fusion;
-- artist-level masked set/context encoder over video tokens;
-- BNNeck + L2-normalized output;
-- sample-dependent raw CLIP residual gate;
+- Linear/LayerNorm projection from CLIP frame embeddings to `model_dim`;
+- frame-level `TransformerEncoder` over each video's 30 frame embeddings;
+- mean pooling from encoded frames to one video token;
+- artist-level masked `TransformerEncoder` over up to 10 video tokens;
+- masked mean pooling over valid videos;
+- projection head + BNNeck + L2-normalized output;
 - training-time video dropout that always keeps at least one valid video.
 
 ## Legacy baselines
