@@ -1,0 +1,4 @@
+interface:
+  display_name: "Polito Thesis Methodology"
+  short_description: "Specify the thesis method."
+  default_prompt: "Use $polito-thesis-methodology to draft or revise the Methodology chapter."

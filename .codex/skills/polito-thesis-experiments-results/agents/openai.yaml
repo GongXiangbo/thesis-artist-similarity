@@ -1,0 +1,4 @@
+interface:
+  display_name: "Polito Thesis Experiments"
+  short_description: "Report experiments and results."
+  default_prompt: "Use $polito-thesis-experiments-results to draft or revise the Experiments and Results chapter."
