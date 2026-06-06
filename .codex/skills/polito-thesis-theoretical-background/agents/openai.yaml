@@ -1,4 +1,0 @@
-interface:
-  display_name: "Polito Thesis Theory"
-  short_description: "Explain prerequisite theory."
-  default_prompt: "Use $polito-thesis-theoretical-background to draft or revise the Theoretical Background chapter."

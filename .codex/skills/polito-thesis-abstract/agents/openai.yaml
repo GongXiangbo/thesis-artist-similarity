@@ -1,4 +1,0 @@
-interface:
-  display_name: "Polito Thesis Abstract"
-  short_description: "Polish this thesis abstract."
-  default_prompt: "Use $polito-thesis-abstract to draft or revise the Abstract in formal Politecnico di Torino thesis English."

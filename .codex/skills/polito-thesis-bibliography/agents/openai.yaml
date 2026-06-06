@@ -1,4 +1,0 @@
-interface:
-  display_name: "Polito Thesis Bibliography"
-  short_description: "Clean citations and bibliography."
-  default_prompt: "Use $polito-thesis-bibliography to revise citations and the Bibliography section."

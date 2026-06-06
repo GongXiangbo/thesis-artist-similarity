@@ -1,4 +1,0 @@
-interface:
-  display_name: "Polito Thesis Contents"
-  short_description: "Plan this thesis structure."
-  default_prompt: "Use $polito-thesis-contents to create or revise the Contents structure for this thesis."

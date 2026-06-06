@@ -1,4 +1,0 @@
-interface:
-  display_name: "Polito Thesis Related Works"
-  short_description: "Synthesize related research."
-  default_prompt: "Use $polito-thesis-related-works to draft or revise the Related Works chapter."

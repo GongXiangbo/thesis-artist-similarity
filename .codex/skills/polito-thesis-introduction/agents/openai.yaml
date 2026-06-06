@@ -1,4 +1,0 @@
-interface:
-  display_name: "Polito Thesis Introduction"
-  short_description: "Frame the thesis introduction."
-  default_prompt: "Use $polito-thesis-introduction to draft or revise the Introduction chapter."
