@@ -1,6 +1,9 @@
 # JetBrains IDE
 .idea/
 
+# Codex local files
+.codex/
+
 # 忽略整个 results 文件夹
 results/
 
