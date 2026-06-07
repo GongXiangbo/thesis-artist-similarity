@@ -36,6 +36,8 @@ cd code
 pytest -q
 ```
 
+上面两个训练命令显式传入的是当前 notebook 结果中表现最好的 margin。`experiment.py` 自身的 `--margin` 默认值仍是 `0.5`，如果要复现 README 里的表格，请不要省略该参数。
+
 ## 输入数据约定
 
 训练默认读取：
@@ -46,6 +48,14 @@ pytest -q
 ```
 
 在 notebook 中，工作目录通常是 `code/`，因此 notebook 使用 `Path("../data/video_embeddings")` 和 `Path("../data/triplets/triplets_ids_music_spot.csv")`。在 CLI 中，`experiment.py` 会把相对路径解析到项目根目录。
+
+metadata 分析额外读取：
+
+```text
+../data/metadata/*.csv
+```
+
+`model1_latent_space_metadata.ipynb` 会从项目根目录的 `data/metadata/` 查找 metadata；当前保存输出使用 `artists_genre_country.csv`，并补充 `artists.csv` 中的 artist name。
 
 每个视频 embedding 是 `(frames, dim)`，当前实验使用 `(30, 768)`。`dataset.process_artists` 支持两种 artist 聚合方式：
 
@@ -167,6 +177,7 @@ pytest -q
 | `--video-dropout` | `0.15` |
 | `--negative-mining` | `memory_bank_semihard` |
 | `--distance-fn` | `cosine` |
+| `--margin` | `0.5` |
 | `--epochs` | `30` |
 | `--batch-size` | `128` |
 | `--output-dir` | `results/checkpoints` |
@@ -179,7 +190,7 @@ pytest -q
 
 ## Notebook 说明与结果
 
-五个 notebook 的结构基本一致：
+五个主训练 notebook 的结构基本一致：
 
 1. 设置模型名、随机种子、路径、margin grid、batch size、训练轮数和 mining mode。
 2. 加载 artist embeddings 与 triplet CSV。
@@ -189,7 +200,9 @@ pytest -q
 6. 选择平均 validation MRR 最好的 margin。
 7. 聚合 out-of-fold validation triplet predictions，做 threshold、ROC-AUC/AP、错误分析。
 8. 用最佳单 fold checkpoint 编码所有 artist，计算 nearest-neighbour retrieval metrics。
-9. 尝试 metadata-aware latent-space 分析；当前输出显示 metadata 没被找到，因此跳过。
+9. 尝试 metadata-aware latent-space 分析，并保存 OOF、retrieval、threshold 和 latent embedding CSV。
+
+`model1_latent_space_metadata.ipynb` 是 TripletNet1 的独立补充 notebook：它不重训模型，只复用 TripletNet1 latent CSV 或 best checkpoint，重跑 PCA/t-SNE、metadata merge、group similarity 和 silhouette 分析。
 
 ### `model1.ipynb` / TripletNet1
 
@@ -211,6 +224,20 @@ Margin summary：
 | `0.9` | `0.243517` | `0.844133` | `0.343881` | `0.509479` | `0.997617` | `0.002383` |
 
 Best margin is `0.10`. OOF ranking accuracy is `92.40%`; OOF margin-satisfied accuracy is `87.46%`. Best F1 threshold is `0.2748` with F1 `0.857143`. Retrieval summary: `precision@1=0.551699`, `hit@5=0.799284`, `MRR=0.663495`, `average_precision=0.402115`.
+
+### `model1_latent_space_metadata.ipynb`
+
+用途：在 `model1.ipynb` 已经产出 TripletNet1 latent CSV 或 best checkpoint 后，只重跑 latent-space metadata 分析。
+
+当前保存输出显示：
+
+- latent 输入为 `3892` 个 artist、`256` 维 embedding。
+- metadata 来源为 `data/metadata/artists_genre_country.csv`，匹配 `3892 / 3892` 个 artist。
+- 可用标签列为 `country`、`broad_genre`、`genre`，artist name 来自 metadata 或 `artists.csv`。
+- PCA 与 CPU sklearn t-SNE 默认使用全部可用 artist：country `3858`、broad_genre `3892`、genre `3860`；t-SNE perplexity 为 `40`。
+- 输出目录为 `code/checkpoints/TripletNet1/analysis/latent_metadata/`，包含 projection PNG/CSV、`TripletNet1_latent_with_metadata.csv`、`TripletNet1_group_similarity_<label>.csv` 和 `TripletNet1_silhouette_summary.csv`。
+
+Silhouette summary 当前为 country `-0.023250`、broad_genre `-0.020109`、genre `-0.266220`，说明整体 latent space 对这些 metadata 标签不是强簇分离结构；group similarity summary 仍可用于观察局部风格/国家聚集现象。
 
 ### `model2.ipynb` / TripletNet2
 
@@ -295,3 +322,5 @@ Best margin is `0.20`. OOF ranking accuracy is `89.66%`; OOF margin-satisfied ac
 `model1.ipynb` 的 markdown 描述和当前 `model.py` 中的 `TripletNet1` 实现并非完全同一个复杂度层级。实际运行入口以 `MODEL_REGISTRY` 为准；当前 `TripletNet1` 是简洁 hierarchical Transformer。若要使用 `HierarchicalVideoArtistTripletNet`，需要显式把它加入 registry 或在 notebook 中直接实例化。
 
 五个 notebook 中的跨模型比较 cell 会尝试读取 checkpoint summary CSV。由于 checkpoint 目录不在仓库中，跨模型汇总可能来自旧运行缓存。做论文表格时建议优先使用每个 notebook 自己的 margin summary、OOF triplet summary 和 retrieval summary，并在同一环境中重新运行全部 notebook 以统一代码版本。
+
+`model2.ipynb` 到 `model5.ipynb` 的已保存 metadata cell 仍可能显示 t-SNE/metadata 分析被跳过，因为它们沿用旧的相对路径搜索。TripletNet1 的独立 metadata notebook 已使用项目根目录下的 `data/metadata/`，后续给其他模型补同类分析时建议复用这一套路径和输出约定。
