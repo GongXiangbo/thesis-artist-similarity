@@ -67,19 +67,19 @@ artist -> 最多 10 个视频 -> 每个视频 30 个 CLIP frame embeddings -> 76
 
 ## Notebook 结果摘要
 
-下表按每个 notebook 自己保存的输出汇总，不依赖 gitignored checkpoint CSV。`CV MRR` 是 5-fold validation retrieval MRR 的平均值，也是 notebook 的最佳 margin 选择标准。`OOF ranking` 使用最佳 margin 下所有 out-of-fold validation triplets；每条 OOF 预测都来自没有训练过该 fold artist 的模型。`retrieval MRR` 是用最佳单 fold checkpoint 编码全部 `3892` 个 artist 后，在 `2795` 个至少有 ground-truth positive 的 anchor 上计算的 nearest-neighbour retrieval 指标。
+下表按每个 notebook 自己保存的输出汇总，不依赖 gitignored checkpoint CSV；其中 TripletNet1 的 ROC-AUC/AP 使用 `model1_posthoc_metrics_metadata.ipynb` 从已保存 OOF prediction CSV 补算。`CV MRR` 是 5-fold validation retrieval MRR 的平均值，也是 notebook 的最佳 margin 选择标准。`OOF ranking` 使用最佳 margin 下所有 out-of-fold validation triplets；每条 OOF 预测都来自没有训练过该 fold artist 的模型。`retrieval MRR` 是用最佳单 fold checkpoint 编码全部 `3892` 个 artist 后，在 `2795` 个至少有 ground-truth positive 的 anchor 上计算的 nearest-neighbour retrieval 指标。
 
 | Notebook | 最佳 margin | CV MRR | CV ranking acc | CV margin acc | OOF ranking | OOF margin | ROC-AUC | AP | retrieval P@1 | retrieval hit@5 | retrieval MRR |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| `model1.ipynb` / TripletNet1 | `0.10` | `0.342917` | `0.923997` | `0.874760` | `92.40%` | `87.46%` | `nan` | `nan` | `0.551699` | `0.799284` | `0.663495` |
+| `model1.ipynb` / TripletNet1 | `0.10` | `0.342917` | `0.923997` | `0.874760` | `92.40%` | `87.46%` | `0.9170` | `0.9052` | `0.551699` | `0.799284` | `0.663495` |
 | `model2.ipynb` / TripletNet2 | `0.20` | `0.315455` | `0.914880` | `0.827464` | `91.43%` | `82.69%` | `0.9119` | `0.9049` | `0.365295` | `0.667263` | `0.502433` |
 | `model3.ipynb` / TripletNet3 | `0.10` | `0.309094` | `0.926204` | `0.888465` | `92.58%` | `88.78%` | `0.9259` | `0.9167` | `0.299821` | `0.609660` | `0.438647` |
 | `model4.ipynb` / TripletNet4 | `0.10` | `0.301722` | `0.915925` | `0.883373` | `91.61%` | `88.34%` | `0.9210` | `0.9089` | `0.256887` | `0.548479` | `0.393616` |
 | `model5.ipynb` / TripletNet5 | `0.20` | `0.251099` | `0.897132` | `0.821559` | `89.66%` | `82.07%` | `0.8909` | `0.8776` | `0.256530` | `0.525939` | `0.382906` |
 
-从 notebook 自身结果看，当前 `TripletNet1` 在 CV MRR 与 retrieval MRR 上领先；`TripletNet3` 的 OOF ranking/margin accuracy 和 ROC-AUC/AP 很强；`TripletNet2` 是 Conv1D baseline 中 retrieval 表现最稳的模型。
+从这些结果看，当前 `TripletNet1` 在 CV MRR 与 retrieval MRR 上领先；`TripletNet3` 的 OOF ranking/margin accuracy 和 ROC-AUC/AP 很强；`TripletNet2` 是 Conv1D baseline 中 retrieval 表现最稳的模型。
 
-`model1.ipynb` 的 ROC-AUC/AP 为 `nan`，notebook 输出说明当时运行环境缺少 `sklearn`，因此阈值分析仍有 precision/recall/F1，但 ROC-AUC 和 average precision 被跳过。当前 `code/model1_posthoc_metrics_metadata.ipynb` 会从已保存的 OOF prediction CSV 补算这两个指标。
+TripletNet1 的 ROC-AUC/AP 来自 `code/model1_posthoc_metrics_metadata.ipynb` 的 post-hoc 补算。原始 `model1.ipynb` 输出里这两项是 `nan`，原因是当时运行环境缺少 `sklearn`；OOF prediction CSV 仍然完整保存了 positive/negative pair similarity，因此可以在不重训模型的情况下重算。
 
 ## 阈值与错误分析
 
@@ -97,12 +97,12 @@ artist -> 最多 10 个视频 -> 每个视频 30 个 CLIP frame embeddings -> 76
 
 `code/model1_posthoc_metrics_metadata.ipynb` 是 TripletNet1 专用的训练后分析 notebook。它用于在 `model1.ipynb` 训练完成后，不重训模型，只补跑 pair-level 指标、latent-space 与 metadata 一致性分析：
 
-- 从 `TripletNet1_oof_triplet_predictions.csv` 读取 out-of-fold positive/negative pair cosine similarity，重新计算并保存 ROC-AUC 与 average precision，避免 `model1.ipynb` 旧运行环境缺少 `sklearn` 导致表格里出现 `nan`。
+- 从 `TripletNet1_oof_triplet_predictions.csv` 读取 out-of-fold positive/negative pair cosine similarity，基于 `1132` 个 positive pairs 和 `1132` 个 negative pairs 重新计算 ROC-AUC `0.916974` 与 average precision `0.905226`。
 - 优先复用 `code/checkpoints/TripletNet1/analysis/TripletNet1_artist_latent_embeddings.csv`；如果缓存不存在，会自动查找 TripletNet1 best checkpoint 并重新编码全部 artist。
 - 从 `data/metadata/` 查找 metadata，当前保存输出使用 `artists_genre_country.csv`，并成功匹配 `3892 / 3892` 个 artist。
 - 分析标签包括 `country`、`broad_genre`、`genre`，并补充 `artists.csv` 中的 artist name。
 - 默认用 PCA 和 CPU `sklearn.manifold.TSNE` 对所有可用 artist 作图：country `3858` 个、broad_genre `3892` 个、genre `3860` 个，t-SNE perplexity 为 `40`。
-- 输出保存到 `code/checkpoints/TripletNet1/analysis/posthoc_metrics_metadata/`，包括 ROC-AUC/AP CSV、修正后的 triplet summary、projection PNG/CSV、`TripletNet1_latent_with_metadata.csv`、group similarity summary 和 silhouette summary。
+- 输出保存到 `code/checkpoints/TripletNet1/analysis/posthoc_metrics_metadata/`，包括 `TripletNet1_pair_auc_metrics.csv`、`TripletNet1_triplet_summary_with_auc.csv`、projection PNG/CSV、`TripletNet1_latent_with_metadata.csv`、group similarity summary 和 silhouette summary。
 
 当前保存的 silhouette summary 在 cosine metric 下为负值：country `-0.023250`、broad_genre `-0.020109`、genre `-0.266220`，说明整体 latent space 不是按这些 metadata 标签形成强分离簇；但 group similarity 表显示部分国家和风格组仍有较高的 intra-minus-inter similarity，可作为论文中的定性/诊断分析材料。
 

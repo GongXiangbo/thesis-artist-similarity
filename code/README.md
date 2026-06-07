@@ -223,7 +223,7 @@ Margin summary：
 | `0.7` | `0.260967` | `0.840156` | `0.367353` | `0.412660` | `0.996356` | `0.003644` |
 | `0.9` | `0.243517` | `0.844133` | `0.343881` | `0.509479` | `0.997617` | `0.002383` |
 
-Best margin is `0.10`. OOF ranking accuracy is `92.40%`; OOF margin-satisfied accuracy is `87.46%`. Best F1 threshold is `0.2748` with F1 `0.857143`. Retrieval summary: `precision@1=0.551699`, `hit@5=0.799284`, `MRR=0.663495`, `average_precision=0.402115`.
+Best margin is `0.10`. OOF ranking accuracy is `92.40%`; OOF margin-satisfied accuracy is `87.46%`. Best F1 threshold is `0.2748` with F1 `0.857143`. Post-hoc pair metrics from `model1_posthoc_metrics_metadata.ipynb`: `ROC-AUC=0.916974`, `AP=0.905226`. Retrieval summary: `precision@1=0.551699`, `hit@5=0.799284`, `MRR=0.663495`, `average_precision=0.402115`.
 
 ### `model1_posthoc_metrics_metadata.ipynb`
 
@@ -231,7 +231,7 @@ Best margin is `0.10`. OOF ranking accuracy is `92.40%`; OOF margin-satisfied ac
 
 当前保存输出显示：
 
-- 可从 `TripletNet1_oof_triplet_predictions.csv` 重算 pair-level ROC-AUC 和 average precision，并将结果保存到 `TripletNet1_pair_auc_metrics.csv`。
+- 从 `TripletNet1_oof_triplet_predictions.csv` 重算 pair-level ROC-AUC `0.916974` 和 average precision `0.905226`，使用 `1132` 个 positive pairs 和 `1132` 个 negative pairs，并将结果保存到 `TripletNet1_pair_auc_metrics.csv`。
 - latent 输入为 `3892` 个 artist、`256` 维 embedding。
 - metadata 来源为 `data/metadata/artists_genre_country.csv`，匹配 `3892 / 3892` 个 artist。
 - 可用标签列为 `country`、`broad_genre`、`genre`，artist name 来自 metadata 或 `artists.csv`。
