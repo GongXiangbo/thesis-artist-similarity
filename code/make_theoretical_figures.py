@@ -1,7 +1,7 @@
 import os
 import numpy as np
 import matplotlib.pyplot as plt
-from matplotlib.patches import FancyArrowPatch, Arc, Rectangle
+from matplotlib.patches import Arc, Ellipse, FancyArrowPatch, FancyBboxPatch, Rectangle
 from matplotlib.lines import Line2D
 
 
@@ -12,6 +12,21 @@ from matplotlib.lines import Line2D
 OUTPUT_DIR = "figures"
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
+PAGE_BG = "#f6f8fb"
+PANEL_BG = "#ffffff"
+PANEL_ALT = "#eef5ff"
+PANEL_EDGE = "#c8d4e3"
+TEXT = "#1f2933"
+MUTED = "#5b677a"
+GRID = "#dce3ec"
+BLUE = "#2f5f9e"
+TEAL = "#2a9d8f"
+ORANGE = "#e76f51"
+GOLD = "#e9b44c"
+PURPLE = "#7b6dce"
+GREEN = "#4f9d69"
+PALETTE = [BLUE, TEAL, ORANGE, PURPLE, GREEN, GOLD]
+
 plt.rcParams.update({
     "font.family": "DejaVu Sans",
     "font.size": 11,
@@ -19,19 +34,104 @@ plt.rcParams.update({
     "axes.labelsize": 10,
     "legend.fontsize": 9,
     "figure.titlesize": 13,
-    "pdf.fonttype": 42,
+    "figure.facecolor": PAGE_BG,
+    "axes.facecolor": PANEL_BG,
+    "axes.edgecolor": PANEL_EDGE,
+    "axes.labelcolor": MUTED,
+    "axes.titlecolor": TEXT,
+    "text.color": TEXT,
+    "xtick.color": MUTED,
+    "ytick.color": MUTED,
+    "grid.color": GRID,
+    "grid.linewidth": 0.7,
+    "grid.alpha": 0.65,
+    "lines.solid_capstyle": "round",
     "ps.fonttype": 42,
 })
 
 
 def save_figure(fig, filename_base):
-    pdf_path = os.path.join(OUTPUT_DIR, f"{filename_base}.pdf")
     png_path = os.path.join(OUTPUT_DIR, f"{filename_base}.png")
-    fig.savefig(pdf_path, bbox_inches="tight")
-    fig.savefig(png_path, bbox_inches="tight", dpi=300)
+    fig.savefig(
+        png_path,
+        bbox_inches="tight",
+        dpi=300,
+        facecolor=fig.get_facecolor(),
+    )
     plt.close(fig)
-    print(f"Saved: {pdf_path}")
     print(f"Saved: {png_path}")
+
+
+def style_axis(ax, grid=True):
+    ax.set_facecolor(PANEL_BG)
+    ax.spines["top"].set_visible(False)
+    ax.spines["right"].set_visible(False)
+    ax.spines["left"].set_color(PANEL_EDGE)
+    ax.spines["bottom"].set_color(PANEL_EDGE)
+    ax.spines["left"].set_linewidth(0.9)
+    ax.spines["bottom"].set_linewidth(0.9)
+    ax.tick_params(colors=MUTED, labelsize=9)
+    if grid:
+        ax.grid(True)
+        ax.set_axisbelow(True)
+
+
+def add_rounded_panel(
+    ax,
+    xy,
+    width,
+    height,
+    facecolor=PANEL_BG,
+    edgecolor=PANEL_EDGE,
+    linewidth=1.2,
+    radius=0.025,
+    shadow=True,
+    zorder=1,
+):
+    if shadow:
+        shadow_patch = FancyBboxPatch(
+            (xy[0] + 0.008, xy[1] - 0.01),
+            width,
+            height,
+            boxstyle=f"round,pad=0.014,rounding_size={radius}",
+            linewidth=0,
+            facecolor="#cbd5e1",
+            alpha=0.28,
+            zorder=zorder - 1,
+        )
+        ax.add_patch(shadow_patch)
+
+    panel = FancyBboxPatch(
+        xy,
+        width,
+        height,
+        boxstyle=f"round,pad=0.014,rounding_size={radius}",
+        linewidth=linewidth,
+        edgecolor=edgecolor,
+        facecolor=facecolor,
+        zorder=zorder,
+    )
+    ax.add_patch(panel)
+    return panel
+
+
+def add_flow_arrow(ax, start, end, color=BLUE):
+    arrow = FancyArrowPatch(
+        start,
+        end,
+        arrowstyle="-|>",
+        mutation_scale=18,
+        linewidth=2.0,
+        color=color,
+        shrinkA=3,
+        shrinkB=3,
+        zorder=5,
+    )
+    ax.add_patch(arrow)
+
+
+def add_caption(ax, x, y, text, fontsize=10, ha="center"):
+    ax.text(x, y, text, ha=ha, va="top", fontsize=fontsize, color=MUTED)
 
 
 def simple_pca(X, n_components=2):
@@ -43,8 +143,37 @@ def simple_pca(X, n_components=2):
     X_centered = X - X.mean(axis=0, keepdims=True)
 
     # SVD-based PCA
-    U, S, Vt = np.linalg.svd(X_centered, full_matrices=False)
+    _, _, Vt = np.linalg.svd(X_centered, full_matrices=False)
     return X_centered @ Vt[:n_components].T
+
+
+def add_group_ellipse(ax, points, color, n_std=1.9):
+    if len(points) < 3:
+        return
+
+    covariance = np.cov(points, rowvar=False)
+    values, vectors = np.linalg.eigh(covariance)
+    values = np.maximum(values, 1e-9)
+    order = values.argsort()[::-1]
+    values = values[order]
+    vectors = vectors[:, order]
+
+    angle = np.degrees(np.arctan2(vectors[1, 0], vectors[0, 0]))
+    width, height = 2 * n_std * np.sqrt(values)
+    center = points.mean(axis=0)
+
+    ellipse = Ellipse(
+        center,
+        width=width,
+        height=height,
+        angle=angle,
+        facecolor=color,
+        edgecolor=color,
+        linewidth=1.4,
+        alpha=0.13,
+        zorder=1,
+    )
+    ax.add_patch(ellipse)
 
 
 # ============================================================
@@ -54,89 +183,117 @@ def simple_pca(X, n_components=2):
 def make_figure_1_dimensionality_reduction():
     rng = np.random.default_rng(42)
 
-    fig, ax = plt.subplots(figsize=(11, 4.2))
+    fig, ax = plt.subplots(figsize=(11.6, 4.7))
     ax.set_xlim(0, 1)
     ax.set_ylim(0, 1)
     ax.axis("off")
 
     # Left: high-dimensional embedding matrix
-    matrix_x, matrix_y = 0.07, 0.23
-    matrix_w, matrix_h = 0.24, 0.52
-
-    ax.add_patch(Rectangle(
-        (matrix_x, matrix_y),
-        matrix_w,
-        matrix_h,
-        fill=False,
-        linewidth=1.5
-    ))
+    matrix_x, matrix_y = 0.07, 0.24
+    matrix_w, matrix_h = 0.24, 0.48
+    add_rounded_panel(
+        ax,
+        (matrix_x - 0.025, matrix_y - 0.055),
+        matrix_w + 0.05,
+        matrix_h + 0.16,
+        facecolor=PANEL_BG,
+    )
 
     rows, cols = 10, 12
     cell_w = matrix_w / cols
     cell_h = matrix_h / rows
+    cmap = plt.get_cmap("viridis")
 
     for i in range(rows):
         for j in range(cols):
             value = rng.random()
-            shade = 0.25 + 0.65 * value
             ax.add_patch(Rectangle(
-                (matrix_x + j * cell_w, matrix_y + i * cell_h),
-                cell_w * 0.9,
-                cell_h * 0.85,
-                facecolor=str(shade),
+                (
+                    matrix_x + j * cell_w + cell_w * 0.05,
+                    matrix_y + i * cell_h + cell_h * 0.06,
+                ),
+                cell_w * 0.88,
+                cell_h * 0.82,
+                facecolor=cmap(0.16 + 0.72 * value),
                 edgecolor="white",
-                linewidth=0.4
+                linewidth=0.45,
+                zorder=3,
             ))
 
     ax.text(
         matrix_x + matrix_w / 2,
-        matrix_y + matrix_h + 0.075,
+        matrix_y + matrix_h + 0.07,
         "256-dimensional\nartist embeddings",
         ha="center",
         va="bottom",
-        weight="bold"
+        weight="bold",
+        fontsize=12,
     )
-
-    ax.text(
+    add_caption(
+        ax,
         matrix_x + matrix_w / 2,
-        matrix_y - 0.07,
+        matrix_y - 0.055,
         "High-dimensional feature space",
-        ha="center",
-        va="top"
     )
 
     # Center: PCA / t-SNE block
-    block_x, block_y = 0.43, 0.42
-    block_w, block_h = 0.16, 0.16
-
-    ax.add_patch(Rectangle(
+    block_x, block_y = 0.425, 0.385
+    block_w, block_h = 0.16, 0.23
+    add_rounded_panel(
+        ax,
         (block_x, block_y),
         block_w,
         block_h,
-        fill=False,
-        linewidth=1.5
-    ))
-
+        facecolor=PANEL_ALT,
+        edgecolor="#aac6e8",
+        radius=0.03,
+    )
     ax.text(
         block_x + block_w / 2,
-        block_y + block_h / 2,
+        block_y + block_h * 0.62,
         "PCA / t-SNE",
         ha="center",
         va="center",
-        weight="bold"
+        weight="bold",
+        fontsize=12,
+        color=BLUE,
+    )
+    ax.text(
+        block_x + block_w / 2,
+        block_y + block_h * 0.34,
+        "projection",
+        ha="center",
+        va="center",
+        fontsize=9.5,
+        color=MUTED,
     )
 
     # Right: 2D scatter plot
-    scatter_x, scatter_y = 0.70, 0.20
-    scatter_w, scatter_h = 0.23, 0.56
+    scatter_x, scatter_y = 0.70, 0.22
+    scatter_w, scatter_h = 0.23, 0.50
+    add_rounded_panel(
+        ax,
+        (scatter_x - 0.025, scatter_y - 0.055),
+        scatter_w + 0.05,
+        scatter_h + 0.16,
+        facecolor=PANEL_BG,
+    )
 
-    ax.add_patch(Rectangle(
-        (scatter_x, scatter_y),
-        scatter_w,
-        scatter_h,
-        fill=False,
-        linewidth=1.2
-    ))
+    for frac in np.linspace(0.2, 0.8, 4):
+        ax.plot(
+            [scatter_x, scatter_x + scatter_w],
+            [scatter_y + frac * scatter_h] * 2,
+            color=GRID,
+            linewidth=0.6,
+            zorder=2,
+        )
+        ax.plot(
+            [scatter_x + frac * scatter_w] * 2,
+            [scatter_y, scatter_y + scatter_h],
+            color=GRID,
+            linewidth=0.6,
+            zorder=2,
+        )
 
     # Synthetic clustered scatter
     centers = np.array([
@@ -145,7 +302,7 @@ def make_figure_1_dimensionality_reduction():
         [0.48, 0.32],
     ])
 
-    for c in centers:
+    for idx, c in enumerate(centers):
         pts = c + 0.06 * rng.normal(size=(18, 2))
         pts[:, 0] = np.clip(pts[:, 0], 0.08, 0.92)
         pts[:, 1] = np.clip(pts[:, 1], 0.08, 0.92)
@@ -155,47 +312,48 @@ def make_figure_1_dimensionality_reduction():
             scatter_y + pts[:, 1] * scatter_h,
             s=28,
             alpha=0.85,
-            edgecolors="black",
-            linewidths=0.3
+            color=PALETTE[idx],
+            edgecolors="white",
+            linewidths=0.55,
+            zorder=4,
         )
 
     ax.text(
         scatter_x + scatter_w / 2,
-        scatter_y + scatter_h + 0.075,
+        scatter_y + scatter_h + 0.07,
         "2D latent space\nvisualization",
         ha="center",
         va="bottom",
-        weight="bold"
+        weight="bold",
+        fontsize=12,
     )
-
-    ax.text(
+    add_caption(
+        ax,
         scatter_x + scatter_w / 2,
-        scatter_y - 0.07,
+        scatter_y - 0.055,
         "Artists projected into two dimensions",
-        ha="center",
-        va="top"
     )
 
     # Arrows
-    arrow1 = FancyArrowPatch(
+    add_flow_arrow(
+        ax,
         (matrix_x + matrix_w + 0.03, 0.50),
         (block_x - 0.03, 0.50),
-        arrowstyle="-|>",
-        mutation_scale=15,
-        linewidth=1.5
+        color=BLUE,
     )
-    arrow2 = FancyArrowPatch(
+    add_flow_arrow(
+        ax,
         (block_x + block_w + 0.03, 0.50),
         (scatter_x - 0.03, 0.50),
-        arrowstyle="-|>",
-        mutation_scale=15,
-        linewidth=1.5
+        color=BLUE,
     )
 
-    ax.add_patch(arrow1)
-    ax.add_patch(arrow2)
-
-    fig.suptitle("Dimensionality Reduction for Artist Embeddings", y=0.98)
+    fig.suptitle(
+        "Dimensionality Reduction for Artist Embeddings",
+        y=0.98,
+        color=TEXT,
+        weight="bold",
+    )
     save_figure(fig, "fig1_dimensionality_reduction")
 
 
@@ -217,40 +375,82 @@ def make_figure_2_activation_functions():
     )
 
     functions = [
-        ("Linear", linear, r"$f(x)=x$"),
-        ("Sigmoid", sigmoid, r"$f(x)=\frac{1}{1+e^{-x}}$"),
-        ("Tanh", tanh, r"$f(x)=\tanh(x)$"),
-        ("ReLU", relu, r"$f(x)=\max(0,x)$"),
-        ("GELU", gelu, r"$f(x)\approx0.5x(1+\tanh(\sqrt{2/\pi}(x+0.044715x^3)))$"),
+        ("Linear", linear, r"$f(x)=x$", BLUE, (-5.4, 5.4)),
+        ("Sigmoid", sigmoid, r"$f(x)=\frac{1}{1+e^{-x}}$", TEAL, (-0.1, 1.1)),
+        ("Tanh", tanh, r"$f(x)=\tanh(x)$", ORANGE, (-1.2, 1.2)),
+        ("ReLU", relu, r"$f(x)=\max(0,x)$", PURPLE, (-0.4, 5.4)),
+        (
+            "GELU",
+            gelu,
+            r"$f(x)\approx0.5x(1+\tanh(\cdots))$",
+            GREEN,
+            (-0.5, 5.4),
+        ),
     ]
 
-    fig, axes = plt.subplots(2, 3, figsize=(11, 6.6))
+    fig, axes = plt.subplots(2, 3, figsize=(11.4, 6.9))
     axes = axes.ravel()
 
-    for idx, (name, y, formula) in enumerate(functions):
+    for idx, (name, y, formula, color, ylim) in enumerate(functions):
         ax = axes[idx]
-        ax.plot(x, y, linewidth=2)
-        ax.axhline(0, linewidth=0.8)
-        ax.axvline(0, linewidth=0.8)
-        ax.grid(True, linewidth=0.4, alpha=0.35)
-        ax.set_title(name, weight="bold")
+        style_axis(ax)
+        ax.plot(x, y, linewidth=2.7, color=color)
+        ax.axhline(0, linewidth=0.9, color="#9aa8b8")
+        ax.axvline(0, linewidth=0.9, color="#9aa8b8")
+        ax.set_xlim(-5, 5)
+        ax.set_ylim(*ylim)
+        ax.set_title(name, weight="bold", pad=10)
         ax.set_xlabel("x")
         ax.set_ylabel("f(x)")
         ax.text(
-            0.5,
-            -0.28,
+            0.05,
+            0.90,
             formula,
             transform=ax.transAxes,
-            ha="center",
+            ha="left",
             va="top",
-            fontsize=9
+            fontsize=9,
+            color=TEXT,
+            bbox={
+                "boxstyle": "round,pad=0.28",
+                "facecolor": "#f8fafc",
+                "edgecolor": PANEL_EDGE,
+                "linewidth": 0.7,
+                "alpha": 0.95,
+            },
         )
 
     # Hide the empty sixth subplot
     axes[-1].axis("off")
+    add_rounded_panel(
+        axes[-1],
+        (0.12, 0.28),
+        0.76,
+        0.44,
+        facecolor="#f8fafc",
+        edgecolor=PANEL_EDGE,
+        radius=0.035,
+        shadow=False,
+        zorder=2,
+    )
+    axes[-1].text(
+        0.5,
+        0.5,
+        "Activation functions introduce\nnon-linear transformations",
+        ha="center",
+        va="center",
+        fontsize=11,
+        color=MUTED,
+        transform=axes[-1].transAxes,
+    )
 
-    fig.suptitle("Common Activation Functions in Neural Networks", y=0.99)
-    fig.tight_layout(rect=[0, 0.02, 1, 0.95])
+    fig.suptitle(
+        "Common Activation Functions in Neural Networks",
+        y=0.99,
+        color=TEXT,
+        weight="bold",
+    )
+    fig.tight_layout(rect=[0, 0.02, 1, 0.95], w_pad=2.0, h_pad=2.2)
     save_figure(fig, "fig2_activation_functions")
 
 
@@ -258,26 +458,29 @@ def make_figure_2_activation_functions():
 # Figure 8: Cosine Similarity Geometry
 # ============================================================
 
-def draw_vector(ax, start, end, label):
+def draw_vector(ax, start, end, label, color, label_offset=(0.05, 0.03)):
     arrow = FancyArrowPatch(
         start,
         end,
         arrowstyle="-|>",
         mutation_scale=16,
-        linewidth=2
+        linewidth=2.4,
+        color=color,
+        zorder=4,
     )
     ax.add_patch(arrow)
     ax.text(
-        end[0] + 0.05,
-        end[1] + 0.03,
+        end[0] + label_offset[0],
+        end[1] + label_offset[1],
         label,
         fontsize=11,
-        weight="bold"
+        weight="bold",
+        color=color,
     )
 
 
 def make_figure_8_cosine_similarity_geometry():
-    fig, axes = plt.subplots(1, 2, figsize=(10.5, 4.4))
+    fig, axes = plt.subplots(1, 2, figsize=(10.8, 4.7))
 
     examples = [
         {
@@ -295,23 +498,35 @@ def make_figure_8_cosine_similarity_geometry():
     ]
 
     for ax, ex in zip(axes, examples):
+        style_axis(ax)
         ax.set_aspect("equal")
         ax.set_xlim(-0.1, 1.35)
         ax.set_ylim(-0.1, 1.35)
 
-        ax.axhline(0, linewidth=0.8)
-        ax.axvline(0, linewidth=0.8)
+        ax.axhline(0, linewidth=1.0, color="#9aa8b8")
+        ax.axvline(0, linewidth=1.0, color="#9aa8b8")
+        ax.add_patch(
+            plt.Circle(
+                (0, 0),
+                1.0,
+                fill=False,
+                linestyle="--",
+                linewidth=1.0,
+                edgecolor=GRID,
+                zorder=1,
+            )
+        )
 
         ax.set_xlabel("Embedding dimension 1")
         ax.set_ylabel("Embedding dimension 2")
-        ax.set_title(ex["title"], weight="bold")
+        ax.set_title(ex["title"], weight="bold", pad=10)
 
         origin = np.array([0.0, 0.0])
         v1 = ex["v1"]
         v2 = ex["v2"]
 
-        draw_vector(ax, origin, v1, r"$\mathbf{u}$")
-        draw_vector(ax, origin, v2, r"$\mathbf{v}$")
+        draw_vector(ax, origin, v1, r"$\mathbf{u}$", BLUE)
+        draw_vector(ax, origin, v2, r"$\mathbf{v}$", ORANGE)
 
         # Angle arc
         angle1 = np.degrees(np.arctan2(v1[1], v1[0]))
@@ -325,7 +540,9 @@ def make_figure_8_cosine_similarity_geometry():
             angle=0,
             theta1=theta1,
             theta2=theta2,
-            linewidth=1.5
+            linewidth=2.0,
+            color=GOLD,
+            zorder=3,
         )
         ax.add_patch(arc)
 
@@ -335,7 +552,16 @@ def make_figure_8_cosine_similarity_geometry():
             0.38 * np.sin(mid_angle),
             ex["theta_label"],
             ha="center",
-            va="center"
+            va="center",
+            fontsize=10,
+            color=TEXT,
+            bbox={
+                "boxstyle": "round,pad=0.2",
+                "facecolor": "#fff7df",
+                "edgecolor": "#efd28a",
+                "linewidth": 0.7,
+                "alpha": 0.95,
+            },
         )
 
         similarity = np.dot(v1, v2) / (
@@ -343,24 +569,47 @@ def make_figure_8_cosine_similarity_geometry():
         )
 
         ax.text(
-            0.03,
-            1.22,
+            0.05,
+            1.18,
             rf"$\cos(\theta) = {similarity:.2f}$",
-            fontsize=11
+            fontsize=11,
+            weight="bold",
+            color=TEXT,
+            bbox={
+                "boxstyle": "round,pad=0.3",
+                "facecolor": "#f8fafc",
+                "edgecolor": PANEL_EDGE,
+                "linewidth": 0.8,
+            },
         )
 
-        ax.grid(True, linewidth=0.4, alpha=0.35)
+        ax.legend(
+            handles=[
+                Line2D([0], [0], color=BLUE, lw=2.4, label=r"$\mathbf{u}$"),
+                Line2D([0], [0], color=ORANGE, lw=2.4, label=r"$\mathbf{v}$"),
+            ],
+            loc="lower right",
+            frameon=True,
+            facecolor=PANEL_BG,
+            edgecolor=PANEL_EDGE,
+        )
 
     fig.text(
         0.5,
-        -0.02,
+        -0.01,
         "Cosine similarity depends on vector direction rather than magnitude.",
         ha="center",
-        fontsize=11
+        fontsize=10.5,
+        color=MUTED,
     )
 
-    fig.suptitle("Geometric Interpretation of Cosine Similarity", y=1.02)
-    fig.tight_layout()
+    fig.suptitle(
+        "Geometric Interpretation of Cosine Similarity",
+        y=1.02,
+        color=TEXT,
+        weight="bold",
+    )
+    fig.tight_layout(w_pad=2.6)
     save_figure(fig, "fig8_cosine_similarity_geometry")
 
 
@@ -429,39 +678,86 @@ def make_figure_9_latent_space_visualization():
 
     coords = simple_pca(embeddings, n_components=2)
 
-    fig, ax = plt.subplots(figsize=(7.2, 6.2))
+    fig, ax = plt.subplots(figsize=(7.7, 6.6))
+    style_axis(ax)
 
     unique_labels = list(dict.fromkeys(labels))
+    legend_handles = []
 
-    for label in unique_labels:
+    for idx, label in enumerate(unique_labels):
         mask = labels == label
+        color = PALETTE[idx % len(PALETTE)]
+        points = coords[mask]
+
+        add_group_ellipse(ax, points, color)
         ax.scatter(
-            coords[mask, 0],
-            coords[mask, 1],
-            s=34,
-            alpha=0.78,
-            edgecolors="black",
-            linewidths=0.25,
+            points[:, 0],
+            points[:, 1],
+            s=42,
+            alpha=0.82,
+            color=color,
+            edgecolors=PANEL_BG,
+            linewidths=0.55,
             label=label
         )
 
-    ax.set_title("Artist Latent Space Visualization", weight="bold")
+        centroid = points.mean(axis=0)
+        ax.text(
+            centroid[0],
+            centroid[1],
+            label,
+            ha="center",
+            va="center",
+            fontsize=9,
+            weight="bold",
+            color=color,
+            bbox={
+                "boxstyle": "round,pad=0.25",
+                "facecolor": PANEL_BG,
+                "edgecolor": color,
+                "linewidth": 0.7,
+                "alpha": 0.9,
+            },
+            zorder=5,
+        )
+        legend_handles.append(
+            Line2D(
+                [0],
+                [0],
+                marker="o",
+                color="none",
+                markerfacecolor=color,
+                markeredgecolor=PANEL_BG,
+                markersize=8,
+                label=label,
+            )
+        )
+
+    ax.axhline(0, linewidth=0.9, color="#9aa8b8", alpha=0.7)
+    ax.axvline(0, linewidth=0.9, color="#9aa8b8", alpha=0.7)
+    ax.set_title("Artist Latent Space Visualization", weight="bold", pad=12)
     ax.set_xlabel("Component 1")
     ax.set_ylabel("Component 2")
-    ax.grid(True, linewidth=0.4, alpha=0.35)
-    ax.legend(title="Metadata group", frameon=True)
-
-    ax.text(
-        0.02,
-        -0.12,
-        "Each point represents one artist embedding projected from 256 dimensions to 2 dimensions.",
-        transform=ax.transAxes,
-        ha="left",
-        va="top",
-        fontsize=9
+    ax.legend(
+        handles=legend_handles,
+        title="Metadata group",
+        frameon=True,
+        facecolor=PANEL_BG,
+        edgecolor=PANEL_EDGE,
+        loc="upper right",
     )
 
-    fig.tight_layout()
+    fig.text(
+        0.5,
+        0.015,
+        "Each point represents one artist embedding projected from 256 dimensions to 2 dimensions.",
+        ha="center",
+        va="bottom",
+        fontsize=9,
+        color=MUTED,
+    )
+
+    fig.tight_layout(rect=[0, 0.045, 1, 1])
     save_figure(fig, "fig9_latent_space_visualization")
 
 
