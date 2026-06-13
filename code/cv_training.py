@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 import numpy as np
 import pandas as pd
@@ -10,18 +10,16 @@ import torch
 from torch import nn, optim
 
 from dataset import (
-    build_negative_exclusion_map,
-    create_artist_memory_bank,
     create_dataloaders_from_triplet_lists,
     create_triplets,
-    create_triplets_with_ids,
 )
 from evaluate import evaluate
 from metrics import DistanceName, cosine_distance
-from train import NegativeMiningMode, train
+from train import train
 
 
 TRIPLET_COLUMNS = ("anchor", "positive", "negative")
+OptimizerName = Literal["adamw", "adam"]
 
 
 @dataclass(frozen=True)
@@ -34,12 +32,11 @@ class FoldTrainingConfig:
     batch_size: int = 128
     num_workers: int = 0
     num_epochs: int = 30
+    optimizer_name: OptimizerName = "adamw"
     learning_rate: float = 2e-4
-    weight_decay: float = 1e-6
+    weight_decay: float = 1e-5
     early_stopping_patience: int | None = 8
     distance_fn: DistanceName = "cosine"
-    negative_mining: NegativeMiningMode = "memory_bank_semihard"
-    mining_fallback: str = "closest_valid"
     grad_clip: float | None = 1.0
 
 
@@ -219,6 +216,14 @@ def _make_criterion(margin: float, distance_fn: DistanceName):
     raise ValueError(f"Unsupported distance_fn: {distance_fn!r}")
 
 
+def _make_optimizer(model: nn.Module, config: FoldTrainingConfig):
+    if config.optimizer_name == "adamw":
+        return optim.AdamW(model.parameters(), lr=config.learning_rate, weight_decay=config.weight_decay)
+    if config.optimizer_name == "adam":
+        return optim.Adam(model.parameters(), lr=config.learning_rate, weight_decay=config.weight_decay)
+    raise ValueError(f"Unsupported optimizer_name: {config.optimizer_name!r}")
+
+
 def _state_dict_to_cpu(model: nn.Module) -> dict[str, torch.Tensor]:
     return {name: tensor.detach().cpu().clone() for name, tensor in model.state_dict().items()}
 
@@ -297,25 +302,9 @@ def run_one_fold_margin(
     margin: float,
     artist_averages: dict[str, torch.Tensor],
     config: FoldTrainingConfig,
-    *,
-    negative_source_df: pd.DataFrame | None = None,
 ) -> dict[str, Any]:
-    uses_dynamic_mining = config.negative_mining in {"batch_semihard", "memory_bank_semihard"}
-    if uses_dynamic_mining:
-        train_triplets = create_triplets_with_ids(train_df, artist_averages)
-        # Priority 6: exclude direct known positives and two-hop neighbours from
-        # the negative candidate pool. Passing the full filtered triplet graph as
-        # negative_source_df also protects direct positives that were dropped by
-        # artist-disjoint fold partitioning.
-        positive_map = build_negative_exclusion_map(negative_source_df if negative_source_df is not None else train_df, symmetric=True, include_two_hop=True)
-    else:
-        train_triplets = create_triplets(train_df, artist_averages)
-        positive_map = None
+    train_triplets = create_triplets(train_df, artist_averages)
     val_triplets = create_triplets(val_df, artist_averages)
-    if config.negative_mining == "memory_bank_semihard":
-        memory_bank_ids, memory_bank_tensors = create_artist_memory_bank(train_df, artist_averages)
-    else:
-        memory_bank_ids, memory_bank_tensors = None, None
 
     if not train_triplets or not val_triplets:
         raise RuntimeError(f"Fold {fold_id}, margin={margin}: empty train/validation triplets after tensor creation.")
@@ -329,7 +318,7 @@ def run_one_fold_margin(
 
     model = config.model_class(**config.model_kwargs).to(config.device)
     criterion = _make_criterion(margin, config.distance_fn)
-    optimizer = optim.AdamW(model.parameters(), lr=config.learning_rate, weight_decay=config.weight_decay)
+    optimizer = _make_optimizer(model, config)
     scheduler = optim.lr_scheduler.ReduceLROnPlateau(
         optimizer,
         mode="min",
@@ -356,12 +345,6 @@ def run_one_fold_margin(
             distance_fn=config.distance_fn,
             grad_clip=config.grad_clip,
             return_details=True,
-            negative_mining=config.negative_mining,
-            positive_map=positive_map,
-            mining_fallback=config.mining_fallback,
-            memory_bank_ids=memory_bank_ids,
-            memory_bank_tensors=memory_bank_tensors,
-            memory_bank_batch_size=config.batch_size,
         )
         val_metrics = evaluate(
             model,
@@ -379,7 +362,7 @@ def run_one_fold_margin(
             "model": config.model_name,
             "fold": fold_id,
             "margin": margin,
-            "negative_mining": config.negative_mining,
+            "optimizer": config.optimizer_name,
             "epoch": epoch,
             "train_loss": train_metrics["loss"],
             "train_acc": train_metrics["ranking_acc"],
@@ -389,12 +372,8 @@ def run_one_fold_margin(
             "val_mrr": val_mrr,
             "val_acc": val_metrics["ranking_acc"],
             "val_margin_acc": val_metrics["margin_acc"],
-            "semi_hard_ratio": train_metrics.get("semi_hard_ratio", 0.0),
-            "fallback_ratio": train_metrics.get("fallback_ratio", 0.0),
-            "skipped_ratio": train_metrics.get("skipped_ratio", 0.0),
             "mean_pos_dist": train_metrics.get("mean_pos_dist", 0.0),
             "mean_neg_dist": train_metrics.get("mean_neg_dist", 0.0),
-            "memory_bank_size": train_metrics.get("memory_bank_size", 0),
             "lr": lr,
         }
         history.append(row)
@@ -422,22 +401,13 @@ def run_one_fold_margin(
         else:
             epochs_without_improvement += 1
 
-        mining_bits = ""
-        if config.negative_mining in {"batch_semihard", "memory_bank_semihard"}:
-            bank_bits = f" | bank={train_metrics.get('memory_bank_size', 0)}" if config.negative_mining == "memory_bank_semihard" else ""
-            mining_bits = (
-                f" | semi={train_metrics['semi_hard_ratio']:.1%}"
-                f" | fallback={train_metrics['fallback_ratio']:.1%}"
-                f" | skipped={train_metrics['skipped_ratio']:.1%}"
-                f"{bank_bits}"
-            )
         print(
-            f"fold={fold_id} | mining={config.negative_mining} | margin={margin:.2f} | "
+            f"fold={fold_id} | fixed CSV negatives | margin={margin:.2f} | "
             f"epoch={epoch:03d}/{config.num_epochs} | "
             f"train_loss={train_metrics['loss']:.5f} | train_acc={train_metrics['ranking_acc']:.2%} | "
             f"val_loss={val_metrics['loss']:.5f} | val_mrr={val_mrr:.4f} | "
             f"val_acc={val_metrics['ranking_acc']:.2%} | val_margin_acc={val_metrics['margin_acc']:.2%} | "
-            f"lr={lr:.2e}{mining_bits}"
+            f"lr={lr:.2e}"
         )
 
         if (
@@ -465,7 +435,7 @@ def run_one_fold_margin(
         "model": config.model_name,
         "fold": fold_id,
         "margin": margin,
-        "negative_mining": config.negative_mining,
+        "optimizer": config.optimizer_name,
         "best_epoch": best_epoch,
         "epochs_ran": len(history_df),
         "best_val_mrr": best_val_mrr,
@@ -479,13 +449,6 @@ def run_one_fold_margin(
     }
 
 
-def _history_mean(item: dict[str, Any], column: str) -> float:
-    history = item.get("history")
-    if not isinstance(history, pd.DataFrame) or column not in history.columns or history.empty:
-        return float("nan")
-    return float(history[column].mean())
-
-
 def summarize_cv_results(
     results: list[dict[str, Any]],
     output_dir: Path,
@@ -496,7 +459,7 @@ def summarize_cv_results(
             {
                 "model": item["model"],
                 "margin": item["margin"],
-                "negative_mining": item.get("negative_mining", "fixed"),
+                "optimizer": item.get("optimizer", "adamw"),
                 "fold": item["fold"],
                 "best_epoch": item["best_epoch"],
                 "epochs_ran": item["epochs_ran"],
@@ -504,10 +467,6 @@ def summarize_cv_results(
                 "best_val_acc": item["best_val_acc"],
                 "best_val_margin_acc": item["best_val_margin_acc"],
                 "best_val_loss": item["best_val_loss"],
-                "mean_semi_hard_ratio": _history_mean(item, "semi_hard_ratio"),
-                "mean_fallback_ratio": _history_mean(item, "fallback_ratio"),
-                "mean_skipped_ratio": _history_mean(item, "skipped_ratio"),
-                "mean_memory_bank_size": _history_mean(item, "memory_bank_size"),
                 "checkpoint_path": item["checkpoint_path"],
                 "history_path": item["history_path"],
             }
@@ -517,7 +476,7 @@ def summarize_cv_results(
 
     margin_summary_df = (
         fold_summary_df
-        .groupby(["model", "negative_mining", "margin"], as_index=False)
+        .groupby(["model", "optimizer", "margin"], as_index=False)
         .agg(
             mean_best_val_mrr=("best_val_mrr", "mean"),
             std_best_val_mrr=("best_val_mrr", "std"),
@@ -529,10 +488,6 @@ def summarize_cv_results(
             std_best_val_loss=("best_val_loss", "std"),
             mean_best_epoch=("best_epoch", "mean"),
             mean_epochs_ran=("epochs_ran", "mean"),
-            mean_semi_hard_ratio=("mean_semi_hard_ratio", "mean"),
-            mean_fallback_ratio=("mean_fallback_ratio", "mean"),
-            mean_skipped_ratio=("mean_skipped_ratio", "mean"),
-            mean_memory_bank_size=("mean_memory_bank_size", "mean"),
         )
         .sort_values(
             ["mean_best_val_mrr", "mean_best_val_acc", "mean_best_val_loss"],

@@ -16,7 +16,7 @@ TripletNet1 accepts tensors shaped either:
     (batch, videos, frames, d_model), recommended, or
     (batch, frames, d_model), legacy one-video/averaged format.
 
-TripletNet2-5 keep the legacy 2D artist tensor path shaped
+TripletNet2-4 keep the legacy 2D artist tensor path shaped
 ``(batch, seq_len, d_model)``.
 """
 
@@ -1029,31 +1029,11 @@ class TripletNet4(ConvTripletNet):
         )
 
 
-class TripletNet5(ConvTripletNet):
-    def __init__(
-        self,
-        d_model: int = DEFAULT_EMBEDDING_DIM,
-        seq_len: int = DEFAULT_MAX_SEQ_LEN,
-        output_dim: int = DEFAULT_OUTPUT_DIM,
-    ) -> None:
-        super().__init__(
-            d_model=d_model,
-            seq_len=seq_len,
-            output_dim=output_dim,
-            conv_channels=(256, 256, 256, 128, 128),
-            kernel_sizes=(3, 3, 3, 3, 3),
-            strides=(1, 1, 2, 1, 2),
-            pool_after={0},
-            hidden_dims=(512, 256),
-        )
-
-
 MODEL_REGISTRY: Dict[str, Type[BaseTripletNet]] = {
     "TripletNet1": TripletNet1,
     "TripletNet2": TripletNet2,
     "TripletNet3": TripletNet3,
     "TripletNet4": TripletNet4,
-    "TripletNet5": TripletNet5,
 }
 
 

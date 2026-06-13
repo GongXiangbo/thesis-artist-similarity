@@ -14,7 +14,6 @@ python code/experiment.py \
   --num-frames 30 \
   --video-dropout 0.15 \
   --margin 0.1 \
-  --negative-mining memory_bank_semihard \
   --epochs 30
 ```
 
@@ -24,8 +23,7 @@ python code/experiment.py \
 python code/experiment.py \
   --model TripletNet2 \
   --artist-aggregation mean \
-  --margin 0.2 \
-  --negative-mining memory_bank_semihard \
+  --margin 0.3 \
   --epochs 30
 ```
 
@@ -36,7 +34,7 @@ cd code
 pytest -q
 ```
 
-上面两个训练命令显式传入的是当前 notebook 结果中表现最好的 margin。`experiment.py` 自身的 `--margin` 默认值仍是 `0.5`，如果要复现 README 里的表格，请不要省略该参数。
+上面两个训练命令显式传入的是当前 margin grid 中的中间值 `0.3`。notebook 会完整 sweep `[0.1, 0.3, 0.5, 0.7, 0.9]`，并按 validation retrieval MRR 选择最佳 margin。
 
 ## 输入数据约定
 
@@ -62,7 +60,7 @@ metadata 分析额外读取：
 | aggregation | 输出形状 | 适用模型 | 说明 |
 | --- | --- | --- | --- |
 | `stack` | `(max_videos, frames, dim)`，默认 `(10, 30, 768)` | `TripletNet1` | 保留一个 artist 的多个视频，视频不足时用全零 tensor padding |
-| `mean` | `(frames, dim)`，默认 `(30, 768)` | `TripletNet2` 到 `TripletNet5` | 将一个 artist 的多个视频 tensor 按视频维平均，兼容 legacy Conv1D baselines |
+| `mean` | `(frames, dim)`，默认 `(30, 768)` | `TripletNet2` 到 `TripletNet4` | 将一个 artist 的多个视频 tensor 按视频维平均，兼容 legacy Conv1D baselines |
 
 ## Python 模块说明
 
@@ -81,14 +79,13 @@ metadata 分析额外读取：
 7. 对有效 video token 做 masked mean pooling。
 8. 经过 projection head、`SafeBatchNorm1d` BNNeck 和 L2 normalization 输出 256 维 artist embedding。
 
-`TripletNet2` 到 `TripletNet5` 都继承 `ConvTripletNet`，输入是 legacy `(batch, seq_len, d_model)`：
+`TripletNet2` 到 `TripletNet4` 都继承 `ConvTripletNet`，输入是 legacy `(batch, seq_len, d_model)`：
 
 | 模型 | Conv1D channels | kernel sizes | stride/pool 设计 | projection |
 | --- | --- | --- | --- | --- |
 | `TripletNet2` | `256, 256, 128` | `3, 3, 3` | 第 0、1 层后 max-pool | hidden `256` -> output `256` |
 | `TripletNet3` | `256, 256, 128, 128` | `5, 5, 3, 3` | 第 0、2 层后 max-pool | hidden `256` -> output `256` |
 | `TripletNet4` | `256, 256, 128, 128` | `3, 3, 3, 3` | stride `1, 2, 1, 2`，不额外 pool | hidden `256` -> output `256` |
-| `TripletNet5` | `256, 256, 256, 128, 128` | `3, 3, 3, 3, 3` | 第 0 层后 max-pool，后续 stride 下采样 | hidden `512, 256` -> output `256` |
 
 `model.py` 还保留了一个更复杂的 `HierarchicalVideoArtistTripletNet`，包含 frame set branch、temporal branch、delta branch、artist set/context branch、gated fusion 和 CLIP residual gate。但这个类当前没有加入 `MODEL_REGISTRY`，因此 `build_model("TripletNet1")` 不会使用它。
 
@@ -106,41 +103,13 @@ metadata 分析额外读取：
 - `process_artists`：统一加载所有 artist，并根据 `aggregation="mean"` 或 `"stack"` 输出训练所需 tensor。
 - `filter_triplets`：只保留 anchor、positive、negative 三个 artist 都有 embedding 的 triplet。
 - `split_triplet_dataframe_by_artist`：默认执行严格 artist-disjoint hold-out split。
-- `build_positive_map` / `build_negative_exclusion_map`：构建 negative mining 的排除集合，后者会排除直接正例和二跳邻居。
-- `create_artist_memory_bank`：收集训练 split 中所有 unique artist tensor，用于 global memory-bank mining。
-- `TripletDataset` 与 dataloader helpers：支持 `(a,p,n)` 和 `(a,p,n,anchor_id,positive_id,negative_id)` 两种样本格式。
-
-### `mining.py`
-
-实现 `BatchSemiHardNegativeMiner`。
-
-每个 anchor-positive pair 会从候选 artist pool 中选择一个 negative。候选 mask 会排除：
-
-1. anchor 自己；
-2. 当前 paired positive；
-3. `positive_map` 中已知的 direct positive；
-4. 当使用 `build_negative_exclusion_map(..., include_two_hop=True)` 时，还排除二跳邻居。
-
-选择优先级：
-
-1. 距离满足 `d(a,p) < d(a,n) < d(a,p) + margin` 的 closest semi-hard negative；
-2. 如果没有 semi-hard，则选择距离大于 positive distance 的 closest valid negative；
-3. 如果所有 valid negatives 都比 positive 更近，则选择 closest valid negative 并产生正 loss；
-4. 如果没有任何 valid candidate，则跳过该 anchor，并通过零 loss 保持 autograd graph 有效。
+- `TripletDataset` 与 dataloader helpers：支持固定 `(a,p,n)` triplet 样本格式。
 
 ### `train.py`
 
-实现一个 epoch 的训练逻辑，支持四种 negative mining mode：
+实现一个 epoch 的固定 triplet 训练逻辑：每个 batch 直接使用 triplet CSV 中已有的 anchor、positive 和 negative。
 
-| mode | 行为 |
-| --- | --- |
-| `fixed` / `random` | 使用 triplet CSV 中已有 negative |
-| `batch_semihard` | 在当前 batch 的 unique artists 中挖 semi-hard negative |
-| `memory_bank_semihard` | 每个 epoch 开始时编码全部训练 artists，作为 global candidate pool 挖 negative |
-
-`memory_bank_semihard` 只用 memory bank embedding 做 negative 选择。选中 negative ID 后，会把对应原始 artist tensor 再 forward 一次，以便 selected negative 的梯度正常回传。
-
-返回指标包括 `loss`、`ranking_acc`、`margin_acc`、`semi_hard_ratio`、`fallback_ratio`、`skipped_ratio`、`mean_pos_dist`、`mean_neg_dist` 和 `memory_bank_size`。
+返回指标包括 `loss`、`ranking_acc`、`margin_acc`、`mean_pos_dist` 和 `mean_neg_dist`。
 
 ### `evaluate.py` 与 `metrics.py`
 
@@ -175,11 +144,13 @@ metadata 分析额外读取：
 | `--videos-per-artist` | `10` |
 | `--num-frames` | `30` |
 | `--video-dropout` | `0.15` |
-| `--negative-mining` | `memory_bank_semihard` |
 | `--distance-fn` | `cosine` |
 | `--margin` | `0.5` |
 | `--epochs` | `30` |
 | `--batch-size` | `128` |
+| `--optimizer` | `adamw` |
+| `--lr` | `2e-4` |
+| `--weight-decay` | `1e-5` |
 | `--output-dir` | `results/checkpoints` |
 
 如果使用 `aggregation="stack"` 且模型不是 `TripletNet1`，程序会直接报错，提示 legacy baselines 应改用 `--artist-aggregation mean`。
@@ -190,9 +161,9 @@ metadata 分析额外读取：
 
 ## Notebook 说明与结果
 
-五个主训练 notebook 的结构基本一致：
+四个主训练 notebook 的结构基本一致：
 
-1. 设置模型名、随机种子、路径、margin grid、batch size、训练轮数和 mining mode。
+1. 设置模型名、随机种子、路径、margin grid、batch size 和训练轮数。
 2. 加载 artist embeddings 与 triplet CSV。
 3. 建立 5-fold artist-disjoint splits。
 4. 对每个 margin 和每个 fold 训练模型。
@@ -204,26 +175,16 @@ metadata 分析额外读取：
 
 `model1_posthoc_metrics_metadata.ipynb` 是 TripletNet1 的独立补充 notebook：它不重训模型，只复用 TripletNet1 OOF prediction CSV、latent CSV 或 best checkpoint，补算 ROC-AUC/AP，并重跑 PCA/t-SNE、metadata merge、group similarity 和 silhouette 分析。
 
-### `model1.ipynb` / TripletNet1
+### `model1.ipynb` 到 `model4.ipynb`
 
-配置：
+四个主训练 notebook 当前统一为 fixed CSV negatives：
 
-- `aggregation="stack"`，artist tensor shape `(10, 30, 768)`。
-- `video_dropout_p=0.15`。
+- `TRIPLETS_CSV = Path("../data/triplets/triplets_ids_music_spot.csv")`。
+- `NUM_EPOCHS = 30`，`distance_fn="cosine"`，这两个口径不参与调参。
 - margin grid: `[0.1, 0.3, 0.5, 0.7, 0.9]`。
-- memory bank size 约 `2405`。
+- 理论选择的统一训练超参：`optimizer="adamw"`、`learning_rate=2e-4`、`weight_decay=1e-5`、`batch_size=128`、`early_stopping_patience=8`。
 
-Margin summary：
-
-| margin | mean_best_val_mrr | mean_best_val_acc | mean_best_val_margin_acc | mean_best_val_loss | semi-hard | fallback |
-| ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| `0.1` | `0.342917` | `0.923997` | `0.874760` | `0.042022` | `0.718619` | `0.281381` |
-| `0.3` | `0.304288` | `0.897113` | `0.638933` | `0.128319` | `0.939471` | `0.060529` |
-| `0.5` | `0.288396` | `0.854684` | `0.428813` | `0.287421` | `0.956375` | `0.043625` |
-| `0.7` | `0.260967` | `0.840156` | `0.367353` | `0.412660` | `0.996356` | `0.003644` |
-| `0.9` | `0.243517` | `0.844133` | `0.343881` | `0.509479` | `0.997617` | `0.002383` |
-
-Best margin is `0.10`. OOF ranking accuracy is `92.40%`; OOF margin-satisfied accuracy is `87.46%`. Best F1 threshold is `0.2748` with F1 `0.857143`. Post-hoc pair metrics from `model1_posthoc_metrics_metadata.ipynb`: `ROC-AUC=0.916974`, `AP=0.905226`. Retrieval summary: `precision@1=0.551699`, `hit@5=0.799284`, `MRR=0.663495`, `average_precision=0.402115`.
+旧的 notebook 输出已经清空，因为之前保存的结果来自动态负例实验，不再对应当前方法。
 
 ### `model1_posthoc_metrics_metadata.ipynb`
 
@@ -240,70 +201,16 @@ Best margin is `0.10`. OOF ranking accuracy is `92.40%`; OOF margin-satisfied ac
 
 Silhouette summary 当前为 country `-0.023250`、broad_genre `-0.020109`、genre `-0.266220`，说明整体 latent space 对这些 metadata 标签不是强簇分离结构；group similarity summary 仍可用于观察局部风格/国家聚集现象。
 
-### `model2.ipynb` / TripletNet2
+### `model2.ipynb` 到 `model4.ipynb`
 
-配置：
+这些 legacy Conv1D baseline 当前同样使用 fixed CSV negatives，并统一为：
 
 - `aggregation="mean"`。
-- margin grid: `[0.1, 0.2, 0.3, 0.5, 0.7, 0.9]`。
+- `NUM_EPOCHS = 30`，`distance_fn="cosine"`。
+- margin grid: `[0.1, 0.3, 0.5, 0.7, 0.9]`。
+- batch size、learning rate、weight decay 和 optimizer 与 `model1.ipynb` 保持一致。
 
-Margin summary：
-
-| margin | mean_best_val_mrr | mean_best_val_acc | mean_best_val_margin_acc | mean_best_val_loss | semi-hard | fallback |
-| ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| `0.2` | `0.315455` | `0.914880` | `0.827464` | `0.068955` | `0.940238` | `0.059762` |
-| `0.1` | `0.315058` | `0.926521` | `0.881193` | `0.038309` | `0.895029` | `0.104971` |
-| `0.3` | `0.303155` | `0.911080` | `0.745368` | `0.101442` | `0.979364` | `0.020636` |
-| `0.5` | `0.282218` | `0.898722` | `0.615089` | `0.194092` | `0.997487` | `0.002513` |
-| `0.7` | `0.263576` | `0.876823` | `0.447342` | `0.349871` | `0.998445` | `0.001555` |
-| `0.9` | `0.237132` | `0.861931` | `0.345797` | `0.485933` | `0.997065` | `0.002935` |
-
-Best margin is `0.20`. OOF ranking accuracy is `91.43%`; OOF margin-satisfied accuracy is `82.69%`; ROC-AUC is `0.9119`; AP is `0.9049`. Retrieval summary: `precision@1=0.365295`, `hit@5=0.667263`, `MRR=0.502433`, `average_precision=0.267810`.
-
-### `model3.ipynb` / TripletNet3
-
-Margin summary：
-
-| margin | mean_best_val_mrr | mean_best_val_acc | mean_best_val_margin_acc | mean_best_val_loss | semi-hard | fallback |
-| ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| `0.1` | `0.309094` | `0.926204` | `0.888465` | `0.040211` | `0.942181` | `0.057819` |
-| `0.3` | `0.302996` | `0.902118` | `0.756390` | `0.100579` | `0.993158` | `0.006842` |
-| `0.2` | `0.293057` | `0.911118` | `0.830851` | `0.070395` | `0.977928` | `0.022072` |
-| `0.5` | `0.274859` | `0.895389` | `0.620637` | `0.197693` | `0.998011` | `0.001989` |
-| `0.7` | `0.253922` | `0.883749` | `0.469128` | `0.334447` | `0.998468` | `0.001532` |
-| `0.9` | `0.207604` | `0.849436` | `0.368629` | `0.498139` | `0.996716` | `0.003284` |
-
-Best margin is `0.10`. OOF ranking accuracy is `92.58%`; OOF margin-satisfied accuracy is `88.78%`; ROC-AUC is `0.9259`; AP is `0.9167`. Retrieval summary: `precision@1=0.299821`, `hit@5=0.609660`, `MRR=0.438647`, `average_precision=0.219581`.
-
-### `model4.ipynb` / TripletNet4
-
-Margin summary：
-
-| margin | mean_best_val_mrr | mean_best_val_acc | mean_best_val_margin_acc | mean_best_val_loss | semi-hard | fallback |
-| ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| `0.1` | `0.301722` | `0.915925` | `0.883373` | `0.043642` | `0.950809` | `0.049191` |
-| `0.3` | `0.289566` | `0.912578` | `0.771310` | `0.101719` | `0.993373` | `0.006627` |
-| `0.2` | `0.288040` | `0.911943` | `0.834835` | `0.070858` | `0.980536` | `0.019464` |
-| `0.5` | `0.267549` | `0.881750` | `0.610898` | `0.208968` | `0.998261` | `0.001739` |
-| `0.7` | `0.239320` | `0.871366` | `0.465483` | `0.340292` | `0.997986` | `0.002014` |
-| `0.9` | `0.211955` | `0.856149` | `0.377649` | `0.514460` | `0.997907` | `0.002093` |
-
-Best margin is `0.10`. OOF ranking accuracy is `91.61%`; OOF margin-satisfied accuracy is `88.34%`; ROC-AUC is `0.9210`; AP is `0.9089`. Retrieval summary: `precision@1=0.256887`, `hit@5=0.548479`, `MRR=0.393616`, `average_precision=0.189462`.
-
-### `model5.ipynb` / TripletNet5
-
-Margin summary：
-
-| margin | mean_best_val_mrr | mean_best_val_acc | mean_best_val_margin_acc | mean_best_val_loss | semi-hard | fallback |
-| ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| `0.2` | `0.251099` | `0.897132` | `0.821559` | `0.096732` | `0.993637` | `0.006363` |
-| `0.1` | `0.249525` | `0.909304` | `0.870621` | `0.061716` | `0.988471` | `0.011529` |
-| `0.3` | `0.242906` | `0.890245` | `0.764782` | `0.127305` | `0.995392` | `0.004608` |
-| `0.5` | `0.197034` | `0.880796` | `0.628561` | `0.230509` | `0.994059` | `0.005941` |
-| `0.7` | `0.187445` | `0.857197` | `0.492263` | `0.372090` | `0.993520` | `0.006480` |
-| `0.9` | `0.145951` | `0.810496` | `0.358295` | `0.605705` | `0.994477` | `0.005523` |
-
-Best margin is `0.20`. OOF ranking accuracy is `89.66%`; OOF margin-satisfied accuracy is `82.07%`; ROC-AUC is `0.8909`; AP is `0.8776`. Retrieval summary: `precision@1=0.256530`, `hit@5=0.525939`, `MRR=0.382906`, `average_precision=0.193078`.
+旧动态负例实验的结果表已移除；请在真实 `data/video_embeddings/` 数据可用时重新运行 notebook 生成 fixed-triplet 结果。
 
 ## 测试覆盖
 
@@ -315,13 +222,11 @@ Best margin is `0.20`. OOF ranking accuracy is `89.66%`; OOF margin-satisfied ac
 - video dropout 至少保留一个有效视频。
 - 非法 frame/video/feature shape 的错误。
 - `stack_tensors` 零 padding 且不循环重复视频。
-- semi-hard negative selection、fallback、known positives/self exclusion、全 skip batch 的 backward。
-- memory-bank mining 的二跳邻居排除和训练 step。
 
 ## 已知口径差异
 
 `model1.ipynb` 的 markdown 描述和当前 `model.py` 中的 `TripletNet1` 实现并非完全同一个复杂度层级。实际运行入口以 `MODEL_REGISTRY` 为准；当前 `TripletNet1` 是简洁 hierarchical Transformer。若要使用 `HierarchicalVideoArtistTripletNet`，需要显式把它加入 registry 或在 notebook 中直接实例化。
 
-五个 notebook 中的跨模型比较 cell 会尝试读取 checkpoint summary CSV。由于 checkpoint 目录不在仓库中，跨模型汇总可能来自旧运行缓存。做论文表格时建议优先使用每个 notebook 自己的 margin summary、OOF triplet summary 和 retrieval summary，并在同一环境中重新运行全部 notebook 以统一代码版本。
+四个 notebook 中的跨模型比较 cell 会尝试读取 checkpoint summary CSV。由于 checkpoint 目录不在仓库中，跨模型汇总可能来自旧运行缓存。做论文表格时建议优先使用每个 notebook 自己的 margin summary、OOF triplet summary 和 retrieval summary，并在同一环境中重新运行全部 notebook 以统一代码版本。
 
-`model2.ipynb` 到 `model5.ipynb` 的已保存 metadata cell 仍可能显示 t-SNE/metadata 分析被跳过，因为它们沿用旧的相对路径搜索。TripletNet1 的独立 post-hoc notebook 已使用项目根目录下的 `data/metadata/`，后续给其他模型补同类分析时建议复用这一套路径和输出约定。
+`model2.ipynb` 到 `model4.ipynb` 的 metadata cell 仍可能显示 t-SNE/metadata 分析被跳过，因为它们沿用旧的相对路径搜索。TripletNet1 的独立 post-hoc notebook 已使用项目根目录下的 `data/metadata/`，后续给其他模型补同类分析时建议复用这一套路径和输出约定。

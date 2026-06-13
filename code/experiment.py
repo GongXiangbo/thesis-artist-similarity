@@ -1,7 +1,7 @@
-"""Unified training entrypoint for comparing TripletNet1~5.
+"""Unified training entrypoint for comparing TripletNet1~4.
 
 Example:
-    python code/experiment.py --model TripletNet1 --margin 0.5 --negative-mining memory_bank_semihard
+    python code/experiment.py --model TripletNet1 --margin 0.5
 """
 
 from __future__ import annotations
@@ -14,11 +14,8 @@ import torch
 from torch import nn, optim
 
 from dataset import (
-    build_negative_exclusion_map,
-    create_artist_memory_bank,
     create_dataloaders_from_triplet_lists,
     create_triplets,
-    create_triplets_with_ids,
     filter_triplets,
     infer_artist_tensor_shape,
     infer_embedding_shape,
@@ -48,18 +45,11 @@ def parse_args():
     parser.add_argument("--epochs", type=int, default=30)
     parser.add_argument("--batch-size", type=int, default=128)
     parser.add_argument("--num-workers", type=int, default=0)
+    parser.add_argument("--optimizer", type=str, default="adamw", choices=["adamw", "adam"])
     parser.add_argument("--lr", type=float, default=2e-4)
-    parser.add_argument("--weight-decay", type=float, default=1e-6)
+    parser.add_argument("--weight-decay", type=float, default=1e-5)
     parser.add_argument("--margin", type=float, default=0.5)
     parser.add_argument("--distance-fn", type=str, default="cosine", choices=["cosine", "euclidean"])
-    parser.add_argument(
-        "--negative-mining",
-        type=str,
-        default="memory_bank_semihard",
-        choices=["fixed", "random", "batch_semihard", "memory_bank_semihard"],
-        help="'memory_bank_semihard' mines hard negatives from all training artists each epoch; validation stays fixed.",
-    )
-    parser.add_argument("--mining-fallback", type=str, default="closest_valid")
     parser.add_argument("--train-ratio", type=float, default=0.8)
     parser.add_argument("--seed", type=int, default=3407)
     parser.add_argument("--output-dir", type=str, default="results/checkpoints")
@@ -114,7 +104,7 @@ def main():
     if len(artist_tensor_shape) == 3 and args.model != "TripletNet1":
         raise RuntimeError(
             "aggregation='stack' produces 4D batches and is currently supported only by TripletNet1. "
-            "Use --artist-aggregation mean for TripletNet2-5."
+            "Use --artist-aggregation mean for TripletNet2-4."
         )
 
     df = pd.read_csv(triplets_csv)
@@ -133,19 +123,7 @@ def main():
         f"frames={seq_len}, d_model={d_model}, videos={inferred_videos}"
     )
 
-    uses_dynamic_mining = args.negative_mining in {"batch_semihard", "memory_bank_semihard"}
-    if uses_dynamic_mining:
-        train_triplets = create_triplets_with_ids(train_df, artist_averages)
-        # Priority 6: exclude known positives and two-hop neighbours so that
-        # hard negatives are less likely to be unlabelled true positives.
-        positive_map = build_negative_exclusion_map(filtered_df, symmetric=True, include_two_hop=True)
-    else:
-        train_triplets = create_triplets(train_df, artist_averages)
-        positive_map = None
-    if args.negative_mining == "memory_bank_semihard":
-        memory_bank_ids, memory_bank_tensors = create_artist_memory_bank(train_df, artist_averages)
-    else:
-        memory_bank_ids, memory_bank_tensors = None, None
+    train_triplets = create_triplets(train_df, artist_averages)
     val_triplets = create_triplets(val_df, artist_averages)
     train_loader, val_loader = create_dataloaders_from_triplet_lists(
         train_triplets,
@@ -163,7 +141,12 @@ def main():
     else:
         criterion = nn.TripletMarginLoss(margin=args.margin, swap=True)
 
-    optimizer = optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+    if args.optimizer == "adamw":
+        optimizer = optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+    elif args.optimizer == "adam":
+        optimizer = optim.Adam(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+    else:
+        raise ValueError(f"Unsupported optimizer: {args.optimizer!r}")
     scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode="min", factor=0.7, patience=3)
 
     best_val_acc = -1.0
@@ -179,25 +162,16 @@ def main():
             device,
             args.distance_fn,
             return_details=True,
-            negative_mining=args.negative_mining,
-            positive_map=positive_map,
-            mining_fallback=args.mining_fallback,
-            memory_bank_ids=memory_bank_ids,
-            memory_bank_tensors=memory_bank_tensors,
-            memory_bank_batch_size=args.batch_size,
         )
         val_metrics = evaluate(model, val_loader, criterion, device, args.distance_fn, return_details=True)
         scheduler.step(val_metrics["loss"])
         row = {
             "epoch": epoch,
-            "negative_mining": args.negative_mining,
+            "optimizer": args.optimizer,
             "train_loss": train_metrics["loss"],
             "train_acc": train_metrics["ranking_acc"],
             "train_triplet_acc": train_metrics["ranking_acc"],
             "train_margin_acc": train_metrics["margin_acc"],
-            "semi_hard_ratio": train_metrics["semi_hard_ratio"],
-            "fallback_ratio": train_metrics["fallback_ratio"],
-            "skipped_ratio": train_metrics["skipped_ratio"],
             "mean_pos_dist": train_metrics["mean_pos_dist"],
             "mean_neg_dist": train_metrics["mean_neg_dist"],
             "val_loss": val_metrics["loss"],
@@ -212,20 +186,11 @@ def main():
             best_val_acc = val_metrics["ranking_acc"]
             best_val_loss = val_metrics["loss"]
             best_state = {key: value.detach().cpu().clone() for key, value in model.state_dict().items()}
-        mining_bits = ""
-        if args.negative_mining in {"batch_semihard", "memory_bank_semihard"}:
-            bank_bits = f" | bank={train_metrics.get('memory_bank_size', 0)}" if args.negative_mining == "memory_bank_semihard" else ""
-            mining_bits = (
-                f" | semi={train_metrics['semi_hard_ratio']:.1%}"
-                f" | fallback={train_metrics['fallback_ratio']:.1%}"
-                f" | skipped={train_metrics['skipped_ratio']:.1%}"
-                f"{bank_bits}"
-            )
         print(
             f"Epoch {epoch:03d}/{args.epochs} | "
             f"train_loss={train_metrics['loss']:.5f} | train_acc={train_metrics['ranking_acc']:.2%} | "
             f"val_loss={val_metrics['loss']:.5f} | val_acc={val_metrics['ranking_acc']:.2%} | "
-            f"lr={optimizer.param_groups[0]['lr']:.2e}{mining_bits}"
+            f"lr={optimizer.param_groups[0]['lr']:.2e}"
         )
 
     history_path = output_dir / f"{args.model}_margin_{args.margin}_history.csv"

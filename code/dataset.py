@@ -565,78 +565,6 @@ def split_triplet_dataframe_by_artist(
     }
 
 
-def build_positive_map(
-    triplet_df: pd.DataFrame,
-    *,
-    symmetric: bool = True,
-) -> dict[str, set[str]]:
-    """Build an anchor -> direct known-positive artist map from triplet rows.
-
-    Use this map to avoid choosing labelled similar artists as negatives. For
-    stricter negative sampling, prefer ``build_negative_exclusion_map(...)``.
-    """
-    df = _normalise_triplet_df(triplet_df)
-    positive_map: dict[str, set[str]] = defaultdict(set)
-    for row in df.itertuples(index=False):
-        anchor = str(getattr(row, "anchor"))
-        positive = str(getattr(row, "positive"))
-        if anchor == positive:
-            continue
-        positive_map[anchor].add(positive)
-        if symmetric:
-            positive_map[positive].add(anchor)
-    return {artist_id: set(positives) for artist_id, positives in positive_map.items()}
-
-
-def build_negative_exclusion_map(
-    triplet_df: pd.DataFrame,
-    *,
-    symmetric: bool = True,
-    include_two_hop: bool = True,
-) -> dict[str, set[str]]:
-    """Build artist sets that should not be sampled as negatives.
-
-    Priority 6: reduce false negatives. Direct known positives are always
-    excluded. With ``include_two_hop=True`` we also exclude friends-of-friends in
-    the similarity graph, which avoids sampling artists from the same local
-    similarity cluster as hard negatives. This is intentionally conservative: if
-    the candidate pool becomes too small, the miner reports skipped anchors
-    rather than silently using likely false negatives.
-    """
-    direct_map = build_positive_map(triplet_df, symmetric=symmetric)
-    exclusion_map: dict[str, set[str]] = {artist_id: set(positives) for artist_id, positives in direct_map.items()}
-
-    if include_two_hop:
-        for artist_id, direct_positives in direct_map.items():
-            two_hop: set[str] = set()
-            for positive_id in direct_positives:
-                two_hop.update(direct_map.get(positive_id, set()))
-            two_hop.discard(artist_id)
-            exclusion_map.setdefault(artist_id, set()).update(two_hop)
-
-    return exclusion_map
-
-
-def create_artist_memory_bank(
-    triplet_df: pd.DataFrame,
-    artist_averages: dict[str, Tensor],
-) -> tuple[list[str], list[Tensor]]:
-    """Return all unique training artists and tensors for global negative mining."""
-    df = _normalise_triplet_df(triplet_df)
-    artists = {str(key): value for key, value in artist_averages.items()}
-    ids: list[str] = []
-    tensors: list[Tensor] = []
-    for artist_id in sorted(_all_triplet_artists(df)):
-        tensor = artists.get(str(artist_id))
-        if tensor is None:
-            continue
-        ids.append(str(artist_id))
-        tensors.append(tensor.float().cpu())
-    if not ids:
-        raise ValueError("Cannot build memory bank: no triplet artists have embeddings")
-    return ids, tensors
-
-
 def create_triplets(filtered_df: pd.DataFrame, artist_averages: dict[str, Tensor]) -> list[tuple[Tensor, Tensor, Tensor]]:
     triplets: list[tuple[Tensor, Tensor, Tensor]] = []
     df = _normalise_triplet_df(filtered_df)
@@ -653,44 +581,8 @@ def create_triplets(filtered_df: pd.DataFrame, artist_averages: dict[str, Tensor
     return triplets
 
 
-def create_triplets_with_ids(
-    filtered_df: pd.DataFrame,
-    artist_averages: dict[str, Tensor],
-) -> list[tuple[Tensor, Tensor, Tensor, str, str, str]]:
-    """Create triplets that keep artist IDs for in-batch negative mining."""
-    triplets: list[tuple[Tensor, Tensor, Tensor, str, str, str]] = []
-    df = _normalise_triplet_df(filtered_df)
-    artists = {str(key): value for key, value in artist_averages.items()}
-    for _, row in df.iterrows():
-        anchor_id = str(row["anchor"])
-        positive_id = str(row["positive"])
-        negative_id = str(row["negative"])
-        anchor = artists.get(anchor_id)
-        positive = artists.get(positive_id)
-        negative = artists.get(negative_id)
-        if anchor is None or positive is None or negative is None:
-            continue
-        if anchor.shape != positive.shape or anchor.shape != negative.shape:
-            continue
-        triplets.append(
-            (
-                anchor.float().cpu(),
-                positive.float().cpu(),
-                negative.float().cpu(),
-                anchor_id,
-                positive_id,
-                negative_id,
-            )
-        )
-    return triplets
-
-
 class TripletDataset(Dataset):
-    """Accepts tensor triplets, optionally followed by artist IDs.
-
-    Valid items are ``(a, p, n)``, ``(a, p, n, anchor_id, positive_id,
-    negative_id)``, or stacked tensors of shape ``(3, ...)``.
-    """
+    """Accepts fixed tensor triplets as ``(a, p, n)`` or stacked ``(3, ...)`` tensors."""
 
     def __init__(self, triplets: Sequence[Any]) -> None:
         self.triplets = list(triplets)
@@ -707,8 +599,8 @@ class TripletDataset(Dataset):
             if item.ndim < 2 or item.shape[0] != 3:
                 raise ValueError("Stacked triplet tensor must have shape (3, ...)")
             return item[0].shape, item[1].shape, item[2].shape
-        if len(item) not in {3, 6}:
-            raise ValueError("Triplet tuple must contain three tensors, optionally followed by three IDs")
+        if len(item) != 3:
+            raise ValueError("Triplet tuple must contain exactly three tensors")
         anchor, positive, negative = item[:3]
         return anchor.shape, positive.shape, negative.shape
 
@@ -720,16 +612,6 @@ class TripletDataset(Dataset):
         if isinstance(item, torch.Tensor):
             return item[0].float(), item[1].float(), item[2].float()
         anchor, positive, negative = item[:3]
-        if len(item) == 6:
-            anchor_id, positive_id, negative_id = item[3:]
-            return (
-                anchor.float(),
-                positive.float(),
-                negative.float(),
-                str(anchor_id),
-                str(positive_id),
-                str(negative_id),
-            )
         return anchor.float(), positive.float(), negative.float()
 
 
