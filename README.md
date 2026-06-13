@@ -22,7 +22,8 @@
 │   ├── metadata/                       # artist metadata CSV
 │   └── triplets/                       # triplet CSV
 ├── results/                            # CLI checkpoint 输出目录，已 gitignore
-└── code/checkpoints/                   # notebook checkpoint 输出目录，已 gitignore
+├── code/checkpoints/                   # notebook checkpoint 输出目录，已 gitignore
+└── code/figures/model1 ... model4      # notebook 图像输出目录
 ```
 
 `data/video_embeddings/` 没有提交到仓库，因为体积较大且已在 `.gitignore` 中排除。训练默认期望每个 artist 的视频 embedding 位于：
@@ -67,6 +68,8 @@ artist -> 最多 10 个视频 -> 每个视频 30 个 CLIP frame embeddings -> 76
 ## Notebook 结果摘要
 
 旧的动态负例实验结果已经不再作为当前口径保留。当前 `model1.ipynb` 到 `model4.ipynb` 均使用 fixed CSV negatives、5-fold artist-disjoint cross-validation、cosine triplet loss 和 margin grid `[0.1, 0.3, 0.5, 0.7, 0.9]`。在真实 `data/video_embeddings/` 数据和 PyTorch 环境可用后，需要重新运行四个 notebook 生成新的 CV、OOF、threshold 和 retrieval 结果。
+
+每个 notebook 生成的图会保存到对应子目录：`code/figures/model1/`、`code/figures/model2/`、`code/figures/model3/`、`code/figures/model4/`。
 
 ## Post-hoc 指标与 metadata 分析
 
