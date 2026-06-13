@@ -138,4 +138,4 @@ code/model1_posthoc_metrics_metadata.ipynb
 
 部分 notebook 的跨模型比较 cell 会读取既有 checkpoint summary CSV。由于 `code/checkpoints/` 被 gitignore，且 notebook 可能在不同代码版本下运行，这些跨模型缓存表可能与单个 notebook 当前保存的结果不完全一致。本 README 以每个 notebook 自己的训练输出、OOF 分析和 retrieval 分析为主。
 
-`model2.ipynb` 到 `model4.ipynb` 的 metadata-aware t-SNE cell 仍可能因为相对路径搜索而跳过 metadata。最新的 `model1_posthoc_metrics_metadata.ipynb` 已改为从项目根目录的 `data/metadata/` 读取，并保存了 TripletNet1 的 metadata/t-SNE 结果。若后续要对 TripletNet2~4 做同样分析，应复用这个 notebook 的 metadata 路径逻辑。
+`model1.ipynb` 到 `model4.ipynb` 的 metadata-aware t-SNE cell 会依次从 `../data/metadata/`、`data/metadata/` 和当前目录查找 metadata，因此从 `code/` 目录或项目根目录启动 Jupyter 时都能读取 `artists_genre_country.csv`。独立的 `model1_posthoc_metrics_metadata.ipynb` 也使用项目根目录下的 `data/metadata/`，并保存了 TripletNet1 的 metadata/t-SNE 结果。

@@ -231,4 +231,4 @@ Silhouette summary 当前为 country `-0.023250`、broad_genre `-0.020109`、gen
 
 四个 notebook 中的跨模型比较 cell 会尝试读取 checkpoint summary CSV。由于 checkpoint 目录不在仓库中，跨模型汇总可能来自旧运行缓存。做论文表格时建议优先使用每个 notebook 自己的 margin summary、OOF triplet summary 和 retrieval summary，并在同一环境中重新运行全部 notebook 以统一代码版本。
 
-`model2.ipynb` 到 `model4.ipynb` 的 metadata cell 仍可能显示 t-SNE/metadata 分析被跳过，因为它们沿用旧的相对路径搜索。TripletNet1 的独立 post-hoc notebook 已使用项目根目录下的 `data/metadata/`，后续给其他模型补同类分析时建议复用这一套路径和输出约定。
+`model1.ipynb` 到 `model4.ipynb` 的 metadata cell 会依次从 `../data/metadata/`、`data/metadata/` 和当前目录查找 metadata，因此从 `code/` 目录或项目根目录启动 Jupyter 时都能读取 `artists_genre_country.csv`。TripletNet1 的独立 post-hoc notebook 同样使用项目根目录下的 `data/metadata/`，并保存了对应 metadata/t-SNE 输出。
