@@ -10,7 +10,6 @@
 .
 ├── code/
 │   ├── model1.ipynb ... model4.ipynb   # 四个模型的训练与分析 notebook
-│   ├── model1_posthoc_metrics_metadata.ipynb # TripletNet1 post-hoc 指标与 metadata/t-SNE 分析
 │   ├── model.py                        # TripletNet1~4 及模型注册表
 │   ├── dataset.py                      # embedding 加载、artist 聚合、triplet 构造、split
 │   ├── train.py / evaluate.py          # 固定 triplet 训练与验证循环
@@ -67,22 +66,18 @@ artist -> 最多 10 个视频 -> 每个视频 30 个 CLIP frame embeddings -> 76
 
 ## Notebook 结果摘要
 
-旧的动态负例实验结果已经不再作为当前口径保留。当前 `model1.ipynb` 到 `model4.ipynb` 均使用 fixed CSV negatives、5-fold artist-disjoint cross-validation、cosine triplet loss 和 margin grid `[0.1, 0.3, 0.5, 0.7, 0.9]`。在真实 `data/video_embeddings/` 数据和 PyTorch 环境可用后，需要重新运行四个 notebook 生成新的 CV、OOF、threshold 和 retrieval 结果。
+旧的动态负例实验结果已经不再作为当前口径保留。`model1.ipynb` 到 `model4.ipynb` 已全部按 fixed CSV negatives、5-fold artist-disjoint cross-validation、cosine triplet loss 和 margin grid `[0.1, 0.3, 0.5, 0.7, 0.9]` 跑完。四个模型的最佳 margin 均为 `0.10`，每个模型的 out-of-fold validation triplets 均为 `1132`。
 
-每个 notebook 生成的图会保存到对应子目录：`code/figures/model1/`、`code/figures/model2/`、`code/figures/model3/`、`code/figures/model4/`。PCA/t-SNE 图使用同一批 sampled artists；t-SNE 会先 PCA 预降维到最多 50 维，再用 cosine t-SNE 生成一套 2D 坐标，country/genre 图只更换着色标签。
+| 模型 | 输入聚合 | best margin | mean validation MRR | OOF ranking acc | OOF margin acc | OOF ROC-AUC | OOF AP | retrieval MRR |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| `TripletNet1` | `stack` | `0.10` | `0.311444` | `90.46%` | `87.90%` | `0.9254` | `0.9127` | `0.405530` |
+| `TripletNet2` | `mean` | `0.10` | `0.278678` | `91.61%` | `84.45%` | `0.9127` | `0.9003` | `0.326258` |
+| `TripletNet3` | `mean` | `0.10` | `0.274923` | `92.05%` | `85.78%` | `0.9113` | `0.8895` | `0.262694` |
+| `TripletNet4` | `mean` | `0.10` | `0.270821` | `90.46%` | `84.63%` | `0.9129` | `0.8998` | `0.333466` |
 
-## Post-hoc 指标与 metadata 分析
+`TripletNet1` 在 mean validation MRR、OOF ROC-AUC/AP 和 full-corpus retrieval MRR 上都是当前最强模型；`TripletNet3` 的 OOF triplet ranking accuracy 最高，但 retrieval 指标明显弱于 `TripletNet1`。最佳 F1 pair threshold 分别为 `TripletNet1=0.273`、`TripletNet2=0.614`、`TripletNet3=0.598`、`TripletNet4=0.517`。四个模型都编码了 `3892` 个 artist，并在 retrieval evaluation 中使用 `2795` 个至少有一个 ground-truth positive 的 anchor artist。
 
-`code/model1_posthoc_metrics_metadata.ipynb` 是 TripletNet1 专用的训练后分析 notebook。它用于在 `model1.ipynb` 训练完成后，不重训模型，只补跑 pair-level 指标、latent-space 与 metadata 一致性分析：
-
-- 从 `TripletNet1_oof_triplet_predictions.csv` 读取 out-of-fold positive/negative pair cosine similarity，基于 `1132` 个 positive pairs 和 `1132` 个 negative pairs 重新计算 ROC-AUC `0.916974` 与 average precision `0.905226`。
-- 优先复用 `code/checkpoints/TripletNet1/analysis/TripletNet1_artist_latent_embeddings.csv`；如果缓存不存在，会自动查找 TripletNet1 best checkpoint 并重新编码全部 artist。
-- 从 `data/metadata/` 查找 metadata，当前保存输出使用 `artists_genre_country.csv`，并成功匹配 `3892 / 3892` 个 artist。
-- 分析标签包括 `country`、`broad_genre`、`genre`，并补充 `artists.csv` 中的 artist name。
-- 默认用 PCA 和 CPU `sklearn.manifold.TSNE` 对所有可用 artist 作图：country `3858` 个、broad_genre `3892` 个、genre `3860` 个，t-SNE perplexity 为 `40`。
-- 输出保存到 `code/checkpoints/TripletNet1/analysis/posthoc_metrics_metadata/`，包括 `TripletNet1_pair_auc_metrics.csv`、`TripletNet1_triplet_summary_with_auc.csv`、projection PNG/CSV、`TripletNet1_latent_with_metadata.csv`、group similarity summary 和 silhouette summary。
-
-当前保存的 silhouette summary 在 cosine metric 下为负值：country `-0.023250`、broad_genre `-0.020109`、genre `-0.266220`，说明整体 latent space 不是按这些 metadata 标签形成强分离簇；但 group similarity 表显示部分国家和风格组仍有较高的 intra-minus-inter similarity，可作为论文中的定性/诊断分析材料。
+每个 notebook 生成的图已保存到对应子目录：`code/figures/model1/`、`code/figures/model2/`、`code/figures/model3/`、`code/figures/model4/`。每个目录包含 margin sensitivity、CV history、cross-model best validation MRR、OOF positive/negative similarity、margin gap、pair threshold analysis，以及 country/genre 的 PCA/t-SNE latent-space 图。PCA/t-SNE 图使用同一批 sampled artists；t-SNE 会先 PCA 预降维到最多 50 维，再用 cosine t-SNE 生成一套 2D 坐标，country/genre 图只更换着色标签。
 
 ## 运行方式
 
@@ -113,7 +108,7 @@ python code/experiment.py \
 python code/experiment.py \
   --model TripletNet2 \
   --artist-aggregation mean \
-  --margin 0.3 \
+  --margin 0.1 \
   --epochs 30
 ```
 
@@ -124,18 +119,10 @@ cd code
 pytest -q
 ```
 
-只重跑 TripletNet1 post-hoc 指标与 metadata/t-SNE 分析时，在 Jupyter 中打开并运行：
-
-```text
-code/model1_posthoc_metrics_metadata.ipynb
-```
-
-该 notebook 期望已有 `TripletNet1_oof_triplet_predictions.csv`，用于补算 ROC-AUC/AP；metadata/t-SNE 部分还需要 TripletNet1 latent CSV 或 best checkpoint。这些运行产物都在 `code/checkpoints/` 下，因体积/运行产物原因不会提交到 git。
-
 ## 重要注意事项
 
 `model1.ipynb` 已对齐当前 `MODEL_REGISTRY` 中的 `TripletNet1` 实现。`model.py` 仍保留一个更复杂的 `HierarchicalVideoArtistTripletNet` 类，但它没有注册到 `MODEL_REGISTRY`；当前通过 `build_model("TripletNet1")` 和 `experiment.py --model TripletNet1` 实际使用的是简洁版 hierarchical Transformer：frame projection、frame-level Transformer、video mean pooling、masked artist-level Transformer、masked mean pooling、projection head、BNNeck、L2 normalization。
 
 部分 notebook 的跨模型比较 cell 会读取既有 checkpoint summary CSV。由于 `code/checkpoints/` 被 gitignore，且 notebook 可能在不同代码版本下运行，这些跨模型缓存表可能与单个 notebook 当前保存的结果不完全一致。本 README 以每个 notebook 自己的训练输出、OOF 分析和 retrieval 分析为主。
 
-`model1.ipynb` 到 `model4.ipynb` 的 metadata-aware t-SNE cell 会依次从 `../data/metadata/`、`data/metadata/` 和当前目录查找 metadata，因此从 `code/` 目录或项目根目录启动 Jupyter 时都能读取 `artists_genre_country.csv`。独立的 `model1_posthoc_metrics_metadata.ipynb` 也使用项目根目录下的 `data/metadata/`，并保存了 TripletNet1 的 metadata/t-SNE 结果。
+`model1.ipynb` 到 `model4.ipynb` 的 metadata-aware t-SNE cell 会依次从 `../data/metadata/`、`data/metadata/` 和当前目录查找 metadata，因此从 `code/` 目录或项目根目录启动 Jupyter 时都能读取 `artists_genre_country.csv`。
