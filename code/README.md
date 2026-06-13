@@ -175,7 +175,7 @@ metadata 分析额外读取：
 
 `model1_posthoc_metrics_metadata.ipynb` 是 TripletNet1 的独立补充 notebook：它不重训模型，只复用 TripletNet1 OOF prediction CSV、latent CSV 或 best checkpoint，补算 ROC-AUC/AP，并重跑 PCA/t-SNE、metadata merge、group similarity 和 silhouette 分析。
 
-所有主训练 notebook 的图像都会保存到 `figures/<model>/`，例如 `model1.ipynb` 保存到 `figures/model1/`。
+所有主训练 notebook 的图像都会保存到 `figures/<model>/`，例如 `model1.ipynb` 保存到 `figures/model1/`。PCA/t-SNE 图使用同一批 sampled artists；t-SNE 会先 PCA 预降维到最多 50 维，再用 cosine t-SNE 生成一套 2D 坐标，country/genre 图只更换着色标签，不重复拟合不同坐标。
 
 ### `model1.ipynb` 到 `model4.ipynb`
 

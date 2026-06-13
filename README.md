@@ -69,7 +69,7 @@ artist -> 最多 10 个视频 -> 每个视频 30 个 CLIP frame embeddings -> 76
 
 旧的动态负例实验结果已经不再作为当前口径保留。当前 `model1.ipynb` 到 `model4.ipynb` 均使用 fixed CSV negatives、5-fold artist-disjoint cross-validation、cosine triplet loss 和 margin grid `[0.1, 0.3, 0.5, 0.7, 0.9]`。在真实 `data/video_embeddings/` 数据和 PyTorch 环境可用后，需要重新运行四个 notebook 生成新的 CV、OOF、threshold 和 retrieval 结果。
 
-每个 notebook 生成的图会保存到对应子目录：`code/figures/model1/`、`code/figures/model2/`、`code/figures/model3/`、`code/figures/model4/`。
+每个 notebook 生成的图会保存到对应子目录：`code/figures/model1/`、`code/figures/model2/`、`code/figures/model3/`、`code/figures/model4/`。PCA/t-SNE 图使用同一批 sampled artists；t-SNE 会先 PCA 预降维到最多 50 维，再用 cosine t-SNE 生成一套 2D 坐标，country/genre 图只更换着色标签。
 
 ## Post-hoc 指标与 metadata 分析
 
